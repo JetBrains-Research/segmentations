@@ -1,2 +1,185 @@
-# segmentations
-Genomic segmentations comparison of ChromHMM vs peak caller based approaches
+# Segmentations
+
+Snakemake pipeline comparing default ChromHMM against peak-caller-based
+binarization (HOMER, MACS2, Omnipeak), with ChromHMM LearnModel and KMeans
+clustering applied on top of each peak-caller binarization.
+All peak callers support both with control and without control settings, 
+so the pipeline works on datasets that lack matched input BAMs.
+
+## Pipeline steps
+
+1. **Config** (`config_encode.yaml` or `config_sagaconf.yaml`) -- configure dataset-specific parameters, input files. 
+
+2. **Data** (`rules/data.smk`) -- download ENCODE BAMs, reference ChromHMM annotations,
+optional RNA-seq; pool BAMs per mark.
+
+3. **Default ChromHMM** (`rules/chromhmm.smk`) -- BinarizeBam + LearnModel on pooled BAMs
+to produce 15-state segmentation. Per-mark BED files are extracted from the binarized profiles.
+Repeated per replicate when available.
+
+4. **Omnipeak** (`rules/omni.smk`) -- control-free peak calling in pooled/per-replicate modes;
+peaks converted to ChromHMM binary matrices. Segmentations per mode: ChromHMM LearnModel and KMeans.
+
+5. **Homer** (`rules/homer.smk`) -- parallel control-free peak caller via `makeTagDirectory` +
+`findPeaks -style histone`. Feeds the same downstream binarization / segmentation machinery
+as Omnipeak, providing a caller-independent cross-check.
+
+6. **State matching** (`rules/match.smk`) -- relabel all segmentations to the ENCODE reference label space using overlap or jaccard strategy (`_matched`). 
+Binarized and bigwig emissions per state are pre-computed as raw values (`.bin_emissions.npz` / `.bw_emissions.npz`)
+and remapped to the matched states.
+
+
+## Processing 
+
+```bash
+DIR=~/data/2026_segmentations
+mkdir -p $DIR && cd $DIR 
+wget https://compbio.mit.edu/ChromHMM/ChromHMM.zip && unzip -q ChromHMM.zip
+wget https://download.jetbrains.com/biolabs/omnipeak/omnipeak-1.6.6883.jar
+```
+
+## Run
+
+### ENCODE analysis
+
+
+```bash
+mkdir -p ~/data/2026_segmentations/encode
+cd ~/data/2026_segmentations/encode
+
+# Add -n to dry run
+# Set REPO to the directory where you cloned omni-chromhmm
+REPO=~/work/omni-chromhmm
+for ds in imr90 monocytes monocytes_mint gm12878_mint spleen \
+ heart_right_ventricle neurosphere sigmoid_colon adrenal_gland thyroid_gland \
+ uterus tibial_nerve heart_left_ventricle substantia_nigra temporal_lobe; do
+  rm $ds/.done;
+  snakemake -p $ds/.done --use-conda --cores all --directory $(pwd) \
+  --snakefile $REPO/Snakefile \
+  --configfile $REPO/config_encode.yaml \
+  --config chromhmm=True homer=True macs2=True omnipeak=True \
+  bw_emissions=True bin_emissions=True \
+  --resources homer_tagdir=1 merge_bam=1 disk_mb=10000 \
+  --keep-going --rerun-incomplete --rerun-trigger mtime;
+done
+```
+
+Resource limits (pass via `--resources`):
+- `homer_tagdir=1` — limits Homer to 2 concurrent tag directories.
+- `merge_bam=1` — limits concurrent BAM merges in `pool_bams`. Each merge writes a
+  multi-GB temporary file; running too many in parallel can fill the disk. Default is 1
+  (sequential); increase if disk space allows.
+
+
+Useful flags: `-p` (echo commands), `-r` (reasons), `--dag | dot -Tpng > dag.png` (DAG visualization).
+
+Joint segmentations across the replicates of a dataset — a single model over `rep1` and `rep2`,
+relabelled to the ENCODE reference with one shared mapping, so both replicates keep the
+joint state space:
+
+```bash
+bash process_encode.sh
+```
+
+### ENCODE Chromosome 1 BAM extraction (Parameter Variance Analysis)
+
+To extract chromosome 1 signal and control BAMs for parameter variance evaluation (`parameters.ipynb`):
+
+```bash
+mkdir -p ~/data/2026_segmentations/encode
+cd ~/data/2026_segmentations/encode
+
+REPO=~/work/omni-chromhmm
+for ds in imr90 monocytes spleen; do
+  snakemake -p \
+    $ds/bams_chr1/{H3K4me3,H3K27ac,H3K4me1,H3K36me3,H3K9me3,H3K27me3}.bam \
+    $ds/controls_chr1/{H3K4me3,H3K27ac,H3K4me1,H3K36me3,H3K9me3,H3K27me3}.bam \
+    --use-conda --cores all --directory $(pwd) \
+    --snakefile $REPO/Snakefile \
+    --configfile $REPO/config_encode.yaml \
+    --keep-going --rerun-incomplete --rerun-trigger mtime;
+done
+```
+
+### ENCODE Chromosome 1 functional ROC sweep
+
+Significance threshold sweep on the chr1 BAMs for the functional ROC analysis (`functional.ipynb`):
+OmniPeak `--fdr`, MACS2 `-q`, HOMER `-fdr` and ChromHMM `BinarizeBam -p`, each threshold
+segmented (KMeans, ChromHMM LearnModel) and matched to the chr1 ENCODE reference
+(`rules/functional.smk`, thresholds in `functional_sweep` of `config_encode.yaml`):
+
+```bash
+cd ~/data/2026_segmentations/encode
+REPO=~/work/omni-chromhmm
+for ds in gm12878_mint monocytes_mint imr90 monocytes spleen \
+  heart_right_ventricle neurosphere sigmoid_colon adrenal_gland thyroid_gland \
+  uterus tibial_nerve heart_left_ventricle substantia_nigra temporal_lobe; do
+  snakemake -p $ds/functional_chr1_sweep/.done \
+  --use-conda --cores all --directory $(pwd) \
+  --snakefile $REPO/Snakefile \
+  --configfile $REPO/config_encode.yaml \
+  --resources homer_tagdir=1 merge_bam=1 disk_mb=10000 \
+  --keep-going --rerun-incomplete --rerun-trigger mtime;
+done
+```
+
+Joint modeling and collective state matching across all sweep parameters (to eliminate sweep trajectory oscillations across methods):
+
+```bash
+bash functional.sh
+```
+
+### 1000 epigenomes analysis
+ 
+[Universal annotation of the human genome through integration of over a thousand epigenomic datasets](https://link.springer.com/article/10.1186/s13059-021-02572-z)
+
+```bash
+mkdir -p ~/data/2026_segmentations/epi1000
+cd ~/data/2026_segmentations/epi1000
+
+bash process_epi1000.sh
+```
+
+`epi1000_replicates.yaml` groups the epigenomes that are replicates of the same biological
+condition (differing only in donor, cell line, sex or consortium); the notebook measures
+segmentation reproducibility within those groups.
+
+### SAGAconf dataset analysis
+
+[Robust chromatin state annotation](https://genome.cshlp.org/content/34/3/469)
+
+```bash
+mkdir -p ~/data/2026_segmentations/sagaconf
+cd ~/data/2026_segmentations/sagaconf
+
+# Add -n to dry run
+# Set REPO to the directory where you cloned omni-chromhmm
+REPO=~/work/omni-chromhmm
+for ds in mcf7 gm12878 k562 cd14_monocyte hela_s3; do
+  rm $ds/.done;
+  snakemake -p $ds/.done --use-conda --cores all --directory $(pwd) \
+  --snakefile $REPO/Snakefile \
+  --configfile $REPO/config_sagaconf.yaml \
+  --config chromhmm=True homer=True macs2=True omnipeak=True \
+  --resources homer_tagdir=1 merge_bam=1 disk_mb=10000 mem_mb=32000 \
+  --keep-going --rerun-incomplete --rerun-trigger mtime;
+done
+```
+
+```bash
+bash process_sagaconf.sh
+```
+
+## Analysis
+
+1. Launch `analysis_encode.ipynb` for ENCODE analysis, cross-segmentation comparison and inter-dataset summary plots.
+2. Launch `analysis_epi1000.ipynb` for analysis of the 1000 epigenomes dataset.
+3. Launch `analysis_sagaconf.ipynb` for analysis of the SAGAconf dataset.
+4. Launch `match.ipynb` to analyze matching strategies and their qualities.
+5. Launch `parameters.ipynb` to analyze the variation of ChromHMM results by different parameters.
+6. Launch `states.ipynb` to analyze the optimal number of states by using TME, Silhouette and Elbow methods. 
+7. Launch `summary.ipynb` last. It recomputes nothing: it reads the metrics from other notebooks, 
+   ranks the eight methods on each comparison and writes the summary ranking and the score profiles.
+
+## Questions?
+Contact Oleg Shpynov (oleg.shpynov@jetbrains.com).

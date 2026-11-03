@@ -1,0 +1,1401 @@
+#!/usr/bin/env python3
+"""Shared naming, plotting and caching helpers for the omni-chromhmm pipeline.
+
+Method keys are {state_model}_{binarization}[_{rep}], plus "ref" for the
+ENCODE reference segmentation.
+"""
+
+import json
+import os
+import pickle
+import random
+import re
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib.container import BarContainer
+from matplotlib.transforms import blended_transform_factory, offset_copy
+import seaborn as sns
+
+
+# Every bar chart of the notebooks is the same figure: mean +- SE bars in
+# BAR_STYLE, the observations on top of them, the joint models hatched, and
+# the mean of each bar written inside the axes. bar_plot() draws it, and the
+# two variants after it cover the composition plots, whose Quiescent state
+# needs either a broken axis or a stack. Every other bar chart of the scripts
+# and notebooks takes the same BAR_STYLE and font sizes below.
+BAR_STYLE = dict(capsize=0.05, errorbar="se", err_kws={"linewidth": 2.0},
+                 edgecolor="lightgrey", linewidth=1)
+TITLE_STYLE = dict(fontsize=12, fontweight="bold")
+AXIS_FONTSIZE = 10
+TICK_FONTSIZE = 9
+LEGEND_FONTSIZE = 9
+LEGEND_TITLE_FONTSIZE = 10
+LABEL_FONTSIZE = 8
+ANNOTATION_FONTSIZE = 8
+FIGURE_DPI = 300
+
+
+def set_style():
+    """Put the plot style above into matplotlib's global rcParams.
+
+    Every notebook calls this at the top, after its imports, and every plotting
+    script at import: text a plot leaves unsized (colorbars, heatmap
+    annotations, seaborn's own labels) and a raw savefig() then get the same
+    fonts and output settings as the figures save_fig() writes. Idempotent.
+    """
+    plt.rcParams.update({
+        "font.size": TICK_FONTSIZE,
+        "axes.titlesize": TITLE_STYLE["fontsize"],
+        "axes.titleweight": TITLE_STYLE["fontweight"],
+        "axes.labelsize": AXIS_FONTSIZE,
+        "xtick.labelsize": TICK_FONTSIZE,
+        "ytick.labelsize": TICK_FONTSIZE,
+        "legend.fontsize": LEGEND_FONTSIZE,
+        "legend.title_fontsize": LEGEND_TITLE_FONTSIZE,
+        "figure.titlesize": TITLE_STYLE["fontsize"],
+        "figure.titleweight": TITLE_STYLE["fontweight"],
+        "savefig.format": "pdf",
+        "savefig.dpi": FIGURE_DPI,
+        "savefig.bbox": "tight",
+        # TrueType rather than Type 3 fonts: the text of a PDF stays editable.
+        "pdf.fonttype": 42,
+    })
+
+# Metrics, every one measured over all the states of the two segmentations.
+# These are the on-disk spelling — the keys of match.agreement_metrics() — so
+# they are kept lowercase and the *_DISPLAY forms below carry the
+# human-readable spelling.
+JACCARD = "jaccard"
+KAPPA = "kappa"
+COSINE = "cosine"
+AMI = "ami"
+
+# The cosine is the cosine of the two state-composition vectors (bp per state)
+# over every state but the biggest one, and nothing else (see
+# match.composition_cosine()). It is blind to *where* the states are: it asks
+# whether the two segmentations spend the genome on states in the same
+# proportions, and two segmentations that agree nowhere still score 1.0 when
+# their state budgets match. The biggest state - the quiescent bulk, in most
+# samples - is left out because it would otherwise saturate the cosine near 1
+# for any pair it dominates. Read it next to kappa, which does look at
+# placement.
+#
+# compare.py reaches the same quantity from the per-state bp vectors of two
+# segment lists and writes it as "composition", which is why that spelling is
+# an alias below.
+COMPOSITION = "composition"
+
+# The AMI (adjusted mutual information) compares two segmentations as
+# partitions of the genome and ignores the state names altogether: it asks how
+# much knowing the state of a bp on one side tells about its state on the other,
+# whatever either side calls that state. Relabelling a side leaves it unchanged,
+# so unlike Jaccard and kappa it does not depend on the state matching, and it
+# stays meaningful for a pair matched to two different references. 1 means
+# identical partitions, 0 the agreement expected by chance. A state weighs by
+# p log p of its genome share, so the small states count and Quies, most of
+# the genome, does not dominate it.
+
+# Agreement of the state *signatures* of two segmentations rather than of their
+# placement: the mean cosine of the emission vectors of the states paired up by
+# match.emission_cosine_mapping(). It says whether two segmentations describe
+# the genome with the same state definitions, so it stays meaningful where the
+# placement metrics do not — across samples that differ biologically.
+#
+# Not one of the metrics normalize_metric() ranks: it is not cached next to
+# jaccard/kappa/cosine, compare.py writes it per pair under this spelling.
+EMISSION = "emission_similarity"
+
+# Metric display names, for plot titles, labels and legends, and for the
+# columns of the notebook caches.
+JACCARD_DISPLAY = "Jaccard"
+KAPPA_DISPLAY = "Kappa"
+COSINE_DISPLAY = "Cosine"
+AMI_DISPLAY = "AMI"
+COMPOSITION_DISPLAY = "Composition"
+EMISSION_DISPLAY = "Emission similarity"
+SENSITIVITY_DISPLAY = "Sensitivity"
+PRECISION_DISPLAY = "Precision"
+SPECIFICITY_DISPLAY = PRECISION_DISPLAY  # Deprecated alias
+
+# Overlap of a state family with an independent annotation of the same sample:
+# the harmonic mean of the annotated share of the family (precision) and of the
+# share of the annotation the family covers (recall). Computed from the
+# per-state enrichment tables by annotation_f1(), so - like the emission
+# similarity - it is not one of the metrics normalize_metric() ranks, and it has
+# no lowercase on-disk spelling because nothing caches it next to
+# jaccard/kappa/cosine.
+#
+# A monotone transform of the Jaccard of the same two sets (F1 = 2J / (1 + J)),
+# so it orders the callers of one annotation exactly as the Jaccard does; it is
+# read instead of the Jaccard because precision and recall are what a validation
+# against an annotation is asking about.
+F1_DISPLAY = "F1"
+
+METRIC_DISPLAY = {JACCARD: JACCARD_DISPLAY, KAPPA: KAPPA_DISPLAY,
+                  COSINE: COSINE_DISPLAY, AMI: AMI_DISPLAY,
+                  COMPOSITION: COMPOSITION_DISPLAY}
+
+# Every on-disk spelling a metric can appear under, most canonical first: the
+# cosine is written as "cosine" by the notebook agreement caches and as
+# "composition" by the comparison tables compare.py feeds.
+METRIC_ALIASES = {COSINE: (COSINE, COMPOSITION)}
+TSS_WINDOW = 2000
+ATAC_WINDOW = 500
+
+
+def normalize_metric(name):
+    """Normalize a metric name (jaccard, kappa, cosine, ami) or None when unknown.
+
+    The display spellings lowercase to the keys, so a cache column name
+    round-trips back to its metric.
+    """
+    name = str(name).strip().lower()
+    return name if name in (JACCARD, KAPPA, COSINE, AMI) else None
+
+
+def metric_aliases(name):
+    """The on-disk spellings of a metric, canonical first — what a cache column
+    may be called. Unknown names are returned unchanged, as a single spelling."""
+    name = str(name).strip().lower()
+    return METRIC_ALIASES.get(name, (name,))
+
+
+def metric_display(name):
+    """Display spelling of a metric name, or None when unknown."""
+    return METRIC_DISPLAY.get(str(name).strip().lower())
+
+# Methods
+CHROMHMM = "chromhmm"
+HOMER = "homer"
+MACS2 = "macs2"
+OMNI = "omni"
+
+# Method family display names
+CHROMHMM_DISPLAY = "ChromHMM"
+HOMER_DISPLAY = "HOMER"
+MACS2_DISPLAY = "MACS2"
+OMNI_DISPLAY = "OmniPeak"
+
+# Display spelling of a caller, which is also the label its group of bars
+# carries in a grouped bar chart (group_methods() below).
+CALLER_DISPLAY = {CHROMHMM: CHROMHMM_DISPLAY, HOMER: HOMER_DISPLAY,
+                  MACS2: MACS2_DISPLAY, OMNI: OMNI_DISPLAY}
+
+# Interpreted state types
+QUIESCENT = "Quiescent"
+FACULTATIVE_HET = "FacultativeHet"
+CONSTITUTIVE_HET = "ConstitutiveHet"
+
+# Canonical keys
+CHROMHMM_DEFAULT = "chromhmm_default"
+CHROMHMM_HOMER = "chromhmm_homer"
+CHROMHMM_MACS2 = "chromhmm_macs2"
+CHROMHMM_OMNI = "chromhmm_omni"
+KMEANS_HOMER = "kmeans_homer"
+KMEANS_MACS2 = "kmeans_macs2"
+KMEANS_OMNI = "kmeans_omni"
+
+JOINT_CHROMHMM = "joint_chromhmm"
+JOINT_KMEANS_HOMER = "joint_kmeans_homer"
+JOINT_KMEANS_MACS2 = "joint_kmeans_macs2"
+JOINT_KMEANS_OMNI = "joint_kmeans_omni"
+
+CALLER_KEYS = {
+    CHROMHMM: (CHROMHMM_DEFAULT, JOINT_CHROMHMM),
+    HOMER:    (KMEANS_HOMER,    JOINT_KMEANS_HOMER),
+    MACS2:    (KMEANS_MACS2,    JOINT_KMEANS_MACS2),
+    OMNI:     (KMEANS_OMNI,     JOINT_KMEANS_OMNI),
+}
+
+
+def method_key(caller, joint=False):
+    """Canonical key of a caller's model: its individual one, or its joint one."""
+    idx = 1 if joint else 0
+    return CALLER_KEYS[caller][idx]
+
+
+METHOD_ORDER = [
+    "ref",
+    # ChromHMM
+    CHROMHMM_DEFAULT,
+    CHROMHMM_HOMER,
+    CHROMHMM_MACS2,
+    CHROMHMM_OMNI,
+    JOINT_CHROMHMM,
+    # HOMER
+    KMEANS_HOMER,
+    JOINT_KMEANS_HOMER,
+    # MACS2
+    KMEANS_MACS2,
+    JOINT_KMEANS_MACS2,
+    # OmniPeak
+    KMEANS_OMNI,
+    JOINT_KMEANS_OMNI,
+    # Replicates
+    f"{CHROMHMM_DEFAULT}_rep1",
+    f"{KMEANS_HOMER}_rep1",
+    f"{KMEANS_MACS2}_rep1",
+    f"{KMEANS_OMNI}_rep1",
+    f"{CHROMHMM_DEFAULT}_rep2",
+    f"{KMEANS_HOMER}_rep2",
+    f"{KMEANS_MACS2}_rep2",
+    f"{KMEANS_OMNI}_rep2",
+]
+
+METHOD_IDX = {m: i for i, m in enumerate(METHOD_ORDER)}
+
+DISPLAY_NAMES = {
+    "ref":                   "ENCODE Ref",
+    "reference":             "ENCODE Reference",
+    CHROMHMM_DEFAULT:      "Default ChromHMM",
+    CHROMHMM_OMNI:         "OmniPeak ChromHMM",
+    CHROMHMM_HOMER:        "Homer ChromHMM",
+    CHROMHMM_MACS2:        "MACS2 ChromHMM",
+    KMEANS_OMNI:           "OmniPeak KMeans",
+    KMEANS_HOMER:          "Homer KMeans",
+    KMEANS_MACS2:          "MACS2 KMeans",
+    JOINT_CHROMHMM:        "Joint ChromHMM",
+    JOINT_KMEANS_OMNI:     "Joint OmniPeak KMeans",
+    JOINT_KMEANS_HOMER:    "Joint Homer KMeans",
+    JOINT_KMEANS_MACS2:    "Joint MACS2 KMeans",
+    f"{CHROMHMM_DEFAULT}_rep1": "Default ChromHMM (rep1)",
+    f"{KMEANS_OMNI}_rep1":      "OmniPeak KMeans (rep1)",
+    f"{KMEANS_HOMER}_rep1":     "Homer KMeans (rep1)",
+    f"{KMEANS_MACS2}_rep1":     "MACS2 KMeans (rep1)",
+    f"{CHROMHMM_DEFAULT}_rep2": "Default ChromHMM (rep2)",
+    f"{KMEANS_OMNI}_rep2":      "OmniPeak KMeans (rep2)",
+    f"{KMEANS_HOMER}_rep2":     "Homer KMeans (rep2)",
+    f"{KMEANS_MACS2}_rep2":     "MACS2 KMeans (rep2)",
+    "ref_15":                   "Ref 15",
+    "joint_ref_15":             "Joint Ref 15",
+}
+
+# Display name back to the key it spells, for the helpers that are handed the
+# labels of a plot rather than the methods behind them.
+_KEY_BY_DISPLAY = {label: key for key, label in DISPLAY_NAMES.items()}
+
+
+def normalize_method(name):
+    """Normalize a method name to its canonical key, or None when unknown."""
+    name = str(name).strip().lower().replace(" ", "_").replace("omnipeak", "omni")
+    if name in (CHROMHMM, "default_chromhmm", CHROMHMM_DEFAULT, "ref_15", "individual"):
+        return CHROMHMM_DEFAULT
+    if name in (JOINT_CHROMHMM, "joint_ref_15", "joint"):
+        return JOINT_CHROMHMM
+    is_joint = name.startswith("joint_")
+    if is_joint:
+        name = name[len("joint_"):]
+    if name.startswith("kmeans_"):
+        name = name[len("kmeans_"):]
+    elif name.endswith("_kmeans"):
+        name = name[:-len("_kmeans")]
+
+    if name in (HOMER, MACS2, OMNI):
+        return method_key(name, joint=is_joint)
+    return None
+
+def normalize_state_name(name):
+    """Remove leading number: '1_TssA' -> 'TssA', '01_TssA' -> 'TssA'."""
+    return re.sub(r"^\d+_", "", str(name).strip())
+
+
+def is_quiescent(name):
+    name = normalize_state_name(name).lower()
+    return name.startswith("quies") or name == "background"
+
+
+def is_background(name):
+    name = normalize_state_name(name).lower()
+    return (name.startswith("quies") or name == "background" or
+            "het" in name or "znf" in name or "rpts" in name or "reprpc" in name)
+
+
+# Core functional state sets
+PROMOTER_CORE_STATES = ("Tss", "TssA", "TssAFlnk")
+PROMOTER_FLANK_STATES = ("TssFlnk", "TssFlnkU", "TssFlnkD")
+PROMOTER_STATES = PROMOTER_CORE_STATES + PROMOTER_FLANK_STATES
+
+DISTAL_ENHANCER_STATES = ("Enh", "EnhA", "EnhAFlnk", "Enh1", "Enh2")
+GENIC_ENHANCER_STATES = ("EnhG", "EnhG1", "EnhG2", "EnhLo")
+ENHANCER_STATES = DISTAL_ENHANCER_STATES + GENIC_ENHANCER_STATES
+
+# Active open chromatin for ATAC-seq validation (excludes non-open genic enhancers)
+ACTIVE_OPEN_STATES = PROMOTER_CORE_STATES + DISTAL_ENHANCER_STATES
+ACTIVE_STATES = PROMOTER_STATES + ENHANCER_STATES
+
+# Transcribed states
+TX_STATES = ("Tx", "TxA", "TxWk", "TxFlnk")
+TX_CORE_STATES = ("Tx", "TxA", "TxFlnk")
+
+BIV_STATES = ("TssBiv", "BivFlnk", "EnhBiv", "Biv")
+
+
+def is_promoter_core(name):
+    return normalize_state_name(name) in PROMOTER_CORE_STATES
+
+
+def is_promoter_flank(name):
+    return normalize_state_name(name) in PROMOTER_FLANK_STATES
+
+
+def is_promoter(name):
+    return normalize_state_name(name) in PROMOTER_STATES
+
+
+def is_distal_enhancer(name):
+    return normalize_state_name(name) in DISTAL_ENHANCER_STATES
+
+
+def is_genic_enhancer(name):
+    return normalize_state_name(name) in GENIC_ENHANCER_STATES
+
+
+def is_enhancer(name):
+    return normalize_state_name(name) in ENHANCER_STATES
+
+
+def is_active_open(name):
+    return normalize_state_name(name) in ACTIVE_OPEN_STATES
+
+
+def is_active(name):
+    return normalize_state_name(name) in ACTIVE_STATES
+
+
+def is_tx_core(name):
+    return normalize_state_name(name) in TX_CORE_STATES
+
+
+def is_tx(name):
+    return normalize_state_name(name) in TX_STATES
+
+
+def is_biv(name):
+    return normalize_state_name(name) in BIV_STATES
+
+# (key, label, state family, annotation label prefix) of the functional
+# validations: a state family against an annotation of the same sample that
+# says which loci are actually active in it, scored by annotation_f1().
+#
+# The RefSeq annotations are deliberately not among them - a TSS the sample
+# does not transcribe is no evidence that a state placed there is wrong or
+# right - and the ATAC-seq label carries the accession of the experiment
+# ("atac_ENCFF243NTP"), so annotations are matched by prefix rather than by
+# name.
+FUNCTIONAL_TARGETS = (
+    ("functional_atac", "Active open chromatin vs ATAC-seq",
+     ACTIVE_OPEN_STATES, "atac_"),
+    ("functional_tss", "Core Tss states vs expressed TSS",
+     PROMOTER_CORE_STATES, "ExpressedTSS2kb"),
+    ("functional_tx", "Tx states vs expressed gene bodies",
+     TX_STATES, "ExpressedGeneBodies"),
+)
+
+# (key, label, state, annotation label prefix) of the one validation scored on
+# a single state, by annotation_jaccard(): the Tx state itself against the
+# expressed gene bodies, the quantity analysis_encode.ipynb plots as
+# summary_jaccard_tx.pdf. Apart from FUNCTIONAL_TARGETS because it is neither a
+# family nor an F1 - swapping the metric on a family would reorder nothing, so
+# what this adds over ("functional_tx", ...) above is the narrower state set:
+# Tx alone, without the TxWk the callers disagree most about.
+FUNCTIONAL_TX_JACCARD = ("functional_tx_jaccard",
+                         "Tx state vs expressed gene bodies",
+                         "Tx", "ExpressedGeneBodies")
+
+
+def annotation_sensitivity_precision(dirpath, states, prefix):
+    """Sensitivity and precision of the union of `states` against every annotation `prefix` names.
+
+    Read off the enrichment and report tables of one segmentation in
+    `dirpath` ({analysis_dir}/{method}), as [{"Label", SENSITIVITY_DISPLAY, PRECISION_DISPLAY}, ...] - one
+    entry per matching annotation, empty when either table is missing or no
+    annotation matches.
+    """
+    enrichment = os.path.join(dirpath, "enrichment", "enrichment.tsv")
+    report = os.path.join(dirpath, "report.tsv")
+    if not (os.path.exists(enrichment) and os.path.exists(report)):
+        return []
+    enrich = pd.read_csv(enrichment, sep="\t")
+    sizes = pd.read_csv(report, sep="\t").set_index("state")["total_bp"]
+    genome = sizes.sum()
+
+    if isinstance(states, str):
+        states = (states,)
+
+    rows = []
+    for label, group in enrich.groupby("label"):
+        if not str(label).startswith(prefix):
+            continue
+        positive = group[group["fold_enrichment"] > 0]
+        if positive.empty:
+            continue
+        annotation = float(np.median(positive["coverage"]
+                                     / positive["fold_enrichment"])) * genome
+        family = group[group["state"].isin(states)]
+        family_bp = float(sizes.reindex(family["state"]).sum())
+        if annotation <= 0 or family_bp <= 0:
+            continue
+        overlap = float((family["coverage"].values
+                         * sizes.reindex(family["state"]).values).sum())
+        rows.append({"Label": str(label),
+                     SENSITIVITY_DISPLAY: overlap / annotation,
+                     PRECISION_DISPLAY: overlap / family_bp})
+    return rows
+
+
+# Deprecated alias
+annotation_sensitivity_specificity = annotation_sensitivity_precision
+
+
+def annotation_f1(dirpath, states, prefix):
+    """F1 of the union of `states` against every annotation `prefix` names.
+
+    Read off the enrichment and report tables of one segmentation in
+    `dirpath` ({analysis_dir}/{method}), as [{"Label", F1_DISPLAY}, ...] - one
+    entry per matching annotation, empty when either table is missing or no
+    annotation matches.
+
+    The enrichment table holds, per state and annotation, the annotated share
+    of the state (coverage) and that share over the share of the genome the
+    annotation takes (fold_enrichment), so the annotation size comes back as
+    coverage / fold_enrichment x genome - as a median over the states that
+    overlap it at all, since a state with no overlap has both at 0.
+
+    The family is scored as one set: its bp are summed and so are its overlaps,
+    rather than averaging the per-state numbers, which would let a tiny state
+    that happens to sit inside the annotation outweigh the family's bulk.
+    """
+    enrichment = os.path.join(dirpath, "enrichment", "enrichment.tsv")
+    report = os.path.join(dirpath, "report.tsv")
+    if not (os.path.exists(enrichment) and os.path.exists(report)):
+        return []
+    enrich = pd.read_csv(enrichment, sep="\t")
+    sizes = pd.read_csv(report, sep="\t").set_index("state")["total_bp"]
+    genome = sizes.sum()
+
+    rows = []
+    for label, group in enrich.groupby("label"):
+        if not str(label).startswith(prefix):
+            continue
+        positive = group[group["fold_enrichment"] > 0]
+        if positive.empty:
+            continue
+        annotation = float(np.median(positive["coverage"]
+                                     / positive["fold_enrichment"])) * genome
+        family = group[group["state"].isin(states)]
+        family_bp = float(sizes.reindex(family["state"]).sum())
+        if annotation <= 0 or family_bp <= 0:
+            continue
+        overlap = float((family["coverage"].values
+                         * sizes.reindex(family["state"]).values).sum())
+        rows.append({"Label": str(label),
+                     F1_DISPLAY: 2 * overlap / (family_bp + annotation)})
+    return rows
+
+
+def extend_bed(bed_data, window):
+    """Extend each interval in bed_data by *window* bp on each side."""
+    return [(row[0], max(0, row[1] - window), row[2] + window) + tuple(row[3:])
+            for row in bed_data]
+
+
+def annotation_jaccard(dirpath, state, prefix):
+    """Jaccard of a single `state` against every annotation `prefix` names.
+
+    Read off enrichment/jaccard.tsv of one segmentation in `dirpath`
+    ({analysis_dir}/{method}), as [{"Label", JACCARD_DISPLAY}, ...] - one entry
+    per matching annotation, empty when the table is missing or no annotation
+    matches.
+
+    One state rather than a family, and the exact bp Jaccard
+    analyze.compute_enrichment() wrote rather than a number recovered from the
+    enrichment table: a family Jaccard would need the union of its states,
+    which the per-state table cannot give, and it would in any case order the
+    callers exactly as annotation_f1() already does (F1 = 2J / (1 + J)).
+    """
+    path = os.path.join(dirpath, "enrichment", "jaccard.tsv")
+    if not os.path.exists(path):
+        return []
+    df = pd.read_csv(path, sep="\t")
+    hits = df[(df["state"].astype(str) == state)
+              & df["label"].astype(str).str.startswith(prefix)]
+    return [{"Label": str(label), JACCARD_DISPLAY: float(value)}
+            for label, value in zip(hits["label"], hits["jaccard"])]
+
+BIN_COLORS = {
+    "default":   "#4878CF",
+    "omnipeak":  "#2CA02C",
+    "homer":     "#9467BD",
+    "macs2":     "#E8833A",
+    "reference": "#888888",
+}
+
+CHROMHMM_BIN = 200
+PEAKS_BIN = 100
+
+
+def method_bin_size(method):
+    """Bin size for a segmentation method: CHROMHMM_BIN (200) for ChromHMM / Reference, PEAKS_BIN (100) for peak callers."""
+    binarization, _, _ = parse_method(str(method))
+    if binarization in ("default", "reference"):
+        return CHROMHMM_BIN
+    return PEAKS_BIN
+
+
+def seg_bin_size(path):
+    """Bin size for a segmentation BED path: CHROMHMM_BIN (200) for ChromHMM / Reference, PEAKS_BIN (100) for peak callers."""
+    return method_bin_size(seg_label(path))
+
+
+def get_bin_size(method_or_path):
+    """Return bin size given a method name or segmentation path."""
+    if isinstance(method_or_path, str) and (os.path.exists(method_or_path) or "/" in method_or_path or method_or_path.endswith(".bed")):
+        return seg_bin_size(method_or_path)
+    return method_bin_size(method_or_path)
+
+
+def parse_method(name):
+    """Parse a method key into (binarization, state_model, rep)."""
+    norm = normalize_method(name)
+    if norm is not None:
+        name = norm
+    if name == "ref":
+        return "reference", "chromhmm", None
+    parts = name.split("_")
+    rep = parts[-1] if parts[-1] in ("rep1", "rep2", "replicate1", "replicate2") else None
+    if rep and rep.startswith("replicate"):
+        rep = "rep" + rep[len("replicate"):]
+    core = parts[:-1] if rep else parts
+
+    if name.startswith("joint_chromhmm"):
+        return "default", "joint_chromhmm", rep
+    if name.startswith("joint_kmeans"):
+        binarization = core[2] if len(core) > 2 else "default"
+        if binarization == "omni": binarization = "omnipeak"
+        return binarization, "joint_kmeans", rep
+
+    state_model = core[0]
+    binarization_key = core[1] if len(core) > 1 else ""
+    if binarization_key == "default":
+        binarization = "default"
+    elif binarization_key == "omni":
+        binarization = "omnipeak"
+    elif binarization_key == "homer":
+        binarization = "homer"
+    elif binarization_key == "macs2":
+        binarization = "macs2"
+    else:
+        binarization = "default"
+    return binarization, state_model, rep
+
+
+METHOD_INFO = {m: parse_method(m) for m in METHOD_ORDER}
+
+
+def caller_key(method):
+    """The caller family (chromhmm, omni, homer, macs2) for a method key."""
+    binarization = parse_method(method)[0]
+    return {"default": CHROMHMM, "omnipeak": OMNI}.get(binarization, binarization)
+
+
+def display_name(method):
+    return DISPLAY_NAMES.get(method, method)
+
+
+def slug(name):
+    """Filename-safe form of a display name: "Joint ChromHMM" -> joint_chromhmm."""
+    return str(name).lower().replace(" ", "_")
+
+
+def is_joint(method):
+    """True for a joint model, by key (joint_omni) or display name (Joint ...)."""
+    return "joint" in str(method).lower()
+
+
+def darken_color(color, factor=0.75):
+    """Darken a color by scaling its RGB values."""
+    rgb = mcolors.to_rgb(color)
+    return mcolors.to_hex(tuple(c * factor for c in rgb)).upper()
+
+
+def bin_color(binarization, joint=False):
+    """Plot color for a binarization type; the neutral grey when unknown."""
+    color = BIN_COLORS.get(binarization, BIN_COLORS["reference"])
+    return darken_color(color) if joint else color
+
+
+def method_color(method):
+    """Plot color for a method; joint models use a darker shade of their caller's colour."""
+    binarization, state_model, _ = parse_method(method)
+    color = bin_color(binarization)
+    if is_joint(method) or (state_model and is_joint(state_model)):
+        return darken_color(color)
+    return color
+
+
+def seg_label(path):
+    """Derive a method key from a segmentation BED file path."""
+    parts = path.replace("\\", "/").split("/")
+    basename = os.path.basename(path)
+
+    if basename.startswith("ENCFF"):
+        return basename.replace(".bed", "")
+
+    reps = ("rep1", "rep2", "replicate1", "replicate2")
+    caller = next((p for p in parts if p in ("omni", "homer", "macs2")), None)
+    rep    = next((p for p in parts if p in reps), None)
+    if rep is None:
+        # A joint model writes one segmentation per replicate into a folder shared
+        # by them, so its replicate is in the file name: rep1_15_dense.bed.
+        rep = next((r for r in reps if basename.startswith(f"{r}_")), None)
+    if rep and rep.startswith("replicate"):
+        rep = "rep" + rep[len("replicate"):]
+
+    if "kmeans_states" in basename:
+        model = f"kmeans_{caller}" if caller else "kmeans"
+    elif "joint_kmeans" in parts or "joint_kmeans" in basename:
+        model = f"joint_kmeans_{caller}" if caller else "joint_kmeans"
+    elif "joint_chromhmm" in parts or "joint_chromhmm" in basename:
+        model = "joint_chromhmm"
+    elif "chromhmm_default_result" in parts:
+        model = "chromhmm_default"
+    else:
+        model = basename.replace(".bed", "").replace("_matched", "")
+
+    if rep:
+        model = f"{model}_{rep}"
+    return model
+
+
+def is_replicate(label):
+    return label.endswith("_rep1") or label.endswith("_rep2")
+
+
+def is_rep_pair(label_i, label_j):
+    """True for the rep1-vs-rep2 pair of one method, whatever else is compared.
+
+    Such a pair is never rematched: both replicates of a dataset were matched
+    to the same reference markup and already share their state names, so
+    realigning one onto the other by maximum overlap would report the agreement
+    of the best relabelling of rep2 rather than the consistency of the method.
+    """
+    return (is_replicate(label_i) and is_replicate(label_j)
+            and label_i != label_j and label_i[:-5] == label_j[:-5])
+
+
+def should_compare(label_i, label_j):
+    """True for pooled-vs-reference pairs and rep1-vs-rep2 of the same method."""
+    ref_i = label_i.startswith("ENCFF")
+    ref_j = label_j.startswith("ENCFF")
+    if ref_i or ref_j:
+        other = label_j if ref_i else label_i
+        return not is_replicate(other)
+    if not (is_replicate(label_i) and is_replicate(label_j)):
+        return False
+    return label_i[:-5] == label_j[:-5]
+
+
+# Every bar chart with an error bar also shows the underlying observations.
+POINT_STYLE = dict(color="#333333", alpha=0.75, linewidth=0.3, edgecolor="white",
+                   zorder=5)
+POINT_SIZE = 12   # matplotlib scatter marker area
+STRIP_SIZE = 2    # seaborn stripplot marker diameter
+_STYLE_KEYS = ("color", "alpha", "linewidth", "edgecolor", "zorder")
+
+
+def _point_style(size, small, kwargs):
+    """POINT_STYLE with per-call overrides pulled out of *kwargs*."""
+    style = dict(POINT_STYLE)
+    if size < small:
+        style["linewidth"] = 0   # a white outline would swallow tiny markers
+    for key in _STYLE_KEYS:
+        if key in kwargs:
+            style[key] = kwargs.pop(key)
+    return style
+
+
+def scatter_points(ax, xpos, values, jitter=0.08, size=POINT_SIZE, **kwargs):
+    """Scatter observations on top of a matplotlib bar centred at *xpos*.
+
+    Jitter is seeded by *xpos*, so re-running reproduces the same figure.
+    """
+    vals = np.asarray(np.ravel(values), dtype=float)
+    vals = vals[~np.isnan(vals)]
+    if len(vals) == 0:
+        return
+    rng = np.random.default_rng(int(round(abs(xpos) * 1000)))
+    offs = rng.uniform(-jitter, jitter, len(vals)) if len(vals) > 1 else np.zeros(1)
+    ax.scatter(xpos + offs, vals, s=size, **_point_style(size, 8, kwargs), **kwargs)
+
+
+def bar_label_y(ax, *values):
+    """Y position for a value label: clear of *values* but inside the axes."""
+    lo, hi = ax.get_ylim()
+    top = max([v for v in values if v is not None and not pd.isna(v)], default=lo)
+    return min(top + 0.01 * (hi - lo), hi - 0.05 * (hi - lo))
+
+
+def strip_points(ax, jitter=0.15, size=STRIP_SIZE, dodge=True, **kwargs):
+    """Overlay observations matching a sns.barplot on *ax*.
+
+    Pass the same data/x/y/hue/order/hue_order as the barplot; use dodge=False
+    when the barplot itself is not dodged (hue == x).
+    """
+    style = _point_style(size, 2.5, kwargs)
+    hue = kwargs.get("hue")
+    if hue is not None:
+        # With a hue, color= would build a gradient palette (one shade per
+        # level); a flat palette keeps every point the same neutral colour.
+        levels = kwargs.get("hue_order")
+        if levels is None:
+            data = kwargs.get("data")
+            levels = pd.unique(data[hue] if data is not None else hue)
+        color = style.pop("color")
+        kwargs["palette"] = {lvl: color for lvl in levels}
+    sns.stripplot(ax=ax, dodge=dodge, jitter=jitter, size=size, legend=False,
+                  **style, **kwargs)
+
+
+JOINT_HATCH = "//"
+
+
+def hatch_joint(ax, order, joint=is_joint):
+    """Hatch the bars of the joint models, which use a darker shade of their caller's colour.
+
+    sns.barplot draws one bar container per hue level, in hue_order order, so
+    pass the same hue_order as the barplot (with x == hue, that is its order).
+    Without a hue there is a single container holding one bar per x level —
+    pass the barplot order instead.
+    """
+    groups = ax.containers
+    if len(groups) == 1 and len(groups[0]) == len(order):
+        groups = [[bar] for bar in groups[0]]
+    for group, method in zip(groups, order):
+        if joint(method):
+            for bar in group:
+                bar.set_hatch(JOINT_HATCH)
+
+
+def hatch_all(ax):
+    """Hatch every bar of *ax*, for a plot of a single joint model.
+
+    The published 18-state and 15-state reference segmentations come from one
+    model trained over every epigenome; a plot showing only such a model has no
+    individual counterpart to pick out, so all of its bars carry the hatch.
+    """
+    for container in ax.containers:
+        for bar in container:
+            bar.set_hatch(JOINT_HATCH)
+
+
+def _group_of(item):
+    """Item as a method name: a bare key or display name, or the first field of
+    a (key, label, ...) tuple."""
+    if isinstance(item, (tuple, list)):
+        item = item[0] if len(item) else ""
+    return item
+
+
+def _method_key_of(name):
+    """The method key *name* stands for - a key, a display name or a spelling
+    normalize_method() knows - or None when it names no method at all.
+
+    parse_method() reads an unknown name as the default binarization, so a
+    dataset or a state would come back as a ChromHMM model; only a name the
+    project actually spells a method with is resolved here.
+    """
+    name = str(name).strip()
+    if name in DISPLAY_NAMES or name in METHOD_IDX:
+        return name
+    return _KEY_BY_DISPLAY.get(name, normalize_method(name))
+
+
+def method_group(method):
+    """Display name of the caller *method* belongs with, or None when it has no
+    caller - a dataset, a state, the ENCODE reference segmentation."""
+    key = _method_key_of(_group_of(method))
+    return None if key is None else CALLER_DISPLAY.get(caller_key(key))
+
+
+def group_methods(items, key=None):
+    """*items* reordered so the models of one caller stand together.
+
+    The callers keep the order in which they first appear, and so do the models
+    within a caller, so a list written as ChromHMM, HOMER, MACS2, OmniPeak
+    comes back laid out that way however its models are interleaved. An item
+    with no caller - "ref" - stays where it is, on its own. *items* are method
+    keys, display names, or tuples whose first field is one of those; pass
+    *key* to read the method off an item of any other shape.
+    """
+    get = _group_of if key is None else key
+    buckets, index = [], {}
+    for item in items:
+        group = method_group(get(item))
+        if group is not None and group in index:
+            buckets[index[group]].append(item)
+            continue
+        if group is not None:
+            index[group] = len(buckets)
+        buckets.append([item])
+    return [item for bucket in buckets for item in bucket]
+
+
+def group_xticks(ax, order, labels=None, key=None, rotation=45, fontsize=None,
+                 **kwargs):
+    """Tick the x axis of *ax*: display name on every tick."""
+    if fontsize is None:
+        fontsize = TICK_FONTSIZE
+    if labels is None:
+        labels = [display_name(level) for level in order]
+    ax.set_xticks(range(len(order)))
+    ax.set_xticklabels(labels, rotation=rotation,
+                       ha="right" if rotation not in (0, 90) else "center",
+                       fontsize=fontsize)
+
+
+def _bars(ax, data, x, y, order, hue, hue_order, palette, color, hatch, points,
+          bar_kwargs, point_data=None):
+    """One sns.barplot in the shared style, with its points and hatching.
+
+    Bars are dodged when *hue* names a second variable; without it the colour
+    follows *x*, which seaborn wants spelled as an undodged hue. *point_data*
+    replaces *data* for the points alone, for a bar of so many observations
+    that drawing all of them would bury it - the bar stays the mean over every
+    row of *data*.
+    """
+    dodge = hue is not None and hue != x
+    plot_hue = hue if hue is not None else (x if palette is not None else None)
+    plot_order = hue_order if dodge else (order if plot_hue is not None else None)
+    style = dict(BAR_STYLE, **bar_kwargs)
+    sns.barplot(data=data, x=x, y=y, hue=plot_hue, order=order,
+                hue_order=plot_order, palette=palette if plot_hue else None,
+                color=color, dodge=dodge, legend=dodge, ax=ax, **style)
+    strip_points(ax, data=data if point_data is None else point_data, x=x, y=y,
+                 **({"hue": hue, "hue_order": hue_order} if dodge else {}),
+                 order=order, dodge=dodge, **(points or {"size": 2}))
+    if hatch == "joint":
+        hatch_joint(ax, plot_order or order)
+    elif hatch == "all":
+        hatch_all(ax)
+
+
+def close_gaps(ax, n_hue):
+    """Centre the dodged bars under every tick of *ax* on it, over the hue
+    levels drawn there.
+
+    seaborn keeps a slot for each of the *n_hue* levels under every tick and
+    draws no bar for a level with no values, so a tick measured in some of them
+    only is drawn off-centre next to an empty
+    slot. Each bar keeps its width; its error bar and its points move with it.
+    """
+    ticks = {}
+    for container in ax.containers:  # one per hue level, in hue order
+        for patch in container:
+            centre = patch.get_x() + patch.get_width() / 2
+            ticks.setdefault(int(round(centre)), []).append(patch)
+    shifts = []  # (old centre, half slot width, shift)
+    for tick, patches in ticks.items():
+        if len(patches) >= n_hue:
+            continue
+        for k, patch in enumerate(patches):
+            width = patch.get_width()
+            centre = patch.get_x() + width / 2
+            shift = tick + (k - (len(patches) - 1) / 2) * width - centre
+            shifts.append((centre, width / 2, shift))
+            patch.set_x(patch.get_x() + shift)
+
+    def moved(pos):
+        for centre, half, shift in shifts:
+            if abs(pos - centre) <= half:
+                return pos + shift
+        return pos
+
+    if not shifts:
+        return
+    for line in ax.lines:
+        line.set_xdata([moved(v) for v in line.get_xdata()])
+    for collection in ax.collections:
+        offsets = collection.get_offsets()
+        if len(offsets):
+            offsets[:, 0] = [moved(v) for v in offsets[:, 0]]
+            collection.set_offsets(offsets)
+
+
+def _bar_legend(ax, levels, legend, title, kwargs):
+    """Restyle the barplot legend outside the axes, or drop it."""
+    if not legend:
+        if ax.get_legend() is not None:
+            ax.get_legend().remove()
+        return
+    opts = dict(title=title, fontsize=LEGEND_FONTSIZE, title_fontsize=LEGEND_TITLE_FONTSIZE,
+                bbox_to_anchor=(1.01, 1), loc="upper left", borderaxespad=0)
+    opts.update(kwargs or {})
+    labels = [display_name(level) for level in levels]
+    # One bar of every group as the handle, so the swatch is the patch itself -
+    # its colour and its hatch. Labelled handles alone give a line per entry.
+    bars = [group[0] for group in ax.containers if len(group)]
+    if len(bars) == len(labels):
+        ax.legend(bars, labels, **opts)
+    else:
+        ax.legend(labels=labels, **opts)
+
+
+def _xticklabels(order, xticklabels):
+    """Tick labels for *order*: as given, display names, or the levels."""
+    if xticklabels in ("display", "group"):
+        return [display_name(level) for level in order]
+    return order if xticklabels is None else xticklabels
+
+
+def bar_labels(ax, data, x, y, order, fmt="{:.2f}", fontsize=LABEL_FONTSIZE):
+    """Write the mean of every bar of *order* above it, inside the axes."""
+    for i, level in enumerate(order):
+        vals = pd.to_numeric(data.loc[data[x] == level, y], errors="coerce").dropna()
+        if vals.empty:
+            continue
+        mean, err = vals.mean(), vals.sem()
+        ax.text(i, bar_label_y(ax, mean + (0 if pd.isna(err) else err), vals.max()),
+                fmt.format(mean), ha="center", va="bottom", fontsize=fontsize)
+
+
+def bar_plot(data, x, y, order=None, hue=None, hue_order=None, palette=None,
+             color=None, ax=None, figsize=(6, 4.2), title=None, xlabel="",
+             ylabel=None, xticklabels=None, rotation=45, tick_fontsize=TICK_FONTSIZE,
+             ylim=None, log=False, labels=None, label_fontsize=LABEL_FONTSIZE, hatch="joint",
+             legend=False, legend_title="Method", legend_kwargs=None, points=None,
+             point_data=None, gaps=True, path=None, **bar_kwargs):
+    """Bar chart of *y* per *x* level, mean +- SE with the observations on top.
+
+    *order* fixes the x levels (defaults to their order of appearance) and
+    *palette* colours them; pass *hue* / *hue_order* instead for grouped bars,
+    or *color* for a single-colour chart. *xticklabels* replaces the tick
+    labels - "display" or "group" for display_name() of *order*. *labels* is a format
+    string for the per-bar mean, which only makes sense without a *hue*, where
+    one bar is one group of values. *hatch* is "joint" for hatch_joint(), "all"
+    for hatch_all(), None for neither, and *points* overrides the
+    strip_points() keywords. *point_data* draws the points off a frame of its
+    own - a subsample of *data*, where a bar holds too many observations to
+    show all of them; the bars stay the mean over *data*. *gaps* False centres
+    the dodged bars of an x level missing some hue levels, close_gaps(). Extra
+    keywords go to sns.barplot().
+
+    Writes the figure to *path* and closes it, or returns the axes when *path*
+    is None; pass *ax* to draw into an existing figure instead.
+    """
+    if order is None:
+        order = list(pd.unique(data[x]))
+    fig = None
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+
+    _bars(ax, data, x, y, order, hue, hue_order, palette, color, hatch, points,
+          bar_kwargs, point_data=point_data)
+    if not gaps and hue is not None and hue != x:
+        close_gaps(ax, len(hue_order or pd.unique(data[hue])))
+
+    if title:
+        ax.set_title(title, **TITLE_STYLE)
+    ax.set_xlabel(xlabel or "", fontsize=AXIS_FONTSIZE)
+    if ylabel is not None:
+        ax.set_ylabel(ylabel, fontsize=AXIS_FONTSIZE)
+    ax.set_xticks(range(len(order)))
+    ax.set_xticklabels(_xticklabels(order, xticklabels), rotation=rotation,
+                       ha="right" if rotation else "center", fontsize=tick_fontsize)
+    ax.tick_params(axis="y", labelsize=tick_fontsize)
+    if log and (pd.to_numeric(data[y], errors="coerce") > 0).any():
+        ax.set_yscale("log")
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    ax.grid(axis="y", alpha=0.3)
+    _bar_legend(ax, hue_order or order, legend, legend_title, legend_kwargs)
+    if labels:
+        if ylim is None and not log:
+            # Headroom for the labels, which bar_label_y() keeps inside the axes
+            # and would otherwise write over the tallest bar.
+            low, high = ax.get_ylim()
+            ax.set_ylim(low, high + 0.07 * (high - low))
+        # After the y limits: a label is placed relative to them.
+        bar_labels(ax, data, x, y, order, fmt=labels, fontsize=label_fontsize)
+    if path is not None and fig is not None:
+        save_fig(fig, path)
+        return None
+    return ax
+
+
+def break_marks(ax_top, ax_bot, size=10):
+    """Diagonal marks on both ends of the break between *ax_top* and *ax_bot*.
+
+    A marker in axes coordinates, so the marks keep their size in points and
+    stay on the corners however the figure is resized afterwards.
+    """
+    style = dict(marker=[(-1, -0.5), (1, 0.5)], markersize=size, linestyle="none",
+                 color="k", mec="k", mew=0.8, clip_on=False)
+    # seaborn leaves autoscaling on, and a new line would rescale the x range
+    # of the categorical axes to the bars plus margins.
+    for ax in (ax_top, ax_bot):
+        ax.set_autoscale_on(False)
+    ax_top.plot([0, 1], [0, 0], transform=ax_top.transAxes, **style)
+    ax_bot.plot([0, 1], [1, 1], transform=ax_bot.transAxes, **style)
+
+
+def broken_bar_plot(data, x, y, order, break_low=0.20, break_high=0.40, top=1.02,
+                    height_ratios=(1, 4), figsize=(12, 6), title=None, xlabel=None,
+                    ylabel=None, xticklabels=None, rotation=45,
+                    tick_fontsize=TICK_FONTSIZE, path=None, **kwargs):
+    """bar_plot() with the y axis broken between *break_low* and *break_high*.
+
+    What the state composition plots need: the Quiescent state covers more than
+    half of the genome, and on a shared 0..1 axis it flattens every other state
+    to nothing. The two axes hold the same bars over the two y ranges, and the
+    break is marked by the hidden inner spines plus a pair of diagonals.
+    """
+    fig, (ax_top, ax_bot) = plt.subplots(
+        2, 1, sharex=True, figsize=figsize,
+        gridspec_kw={"height_ratios": list(height_ratios), "hspace": 0.06})
+    for ax in (ax_top, ax_bot):
+        bar_plot(data, x, y, order=order, ax=ax, rotation=rotation,
+                 tick_fontsize=tick_fontsize, xticklabels=xticklabels,
+                 legend=kwargs.get("legend", False) and ax is ax_top, **{
+                     k: v for k, v in kwargs.items() if k != "legend"})
+    # The break is what carries the scale, so the ranges come after the bars.
+    ax_top.set_ylim(break_high, top)
+    ax_bot.set_ylim(0, break_low)
+    ax_top.spines["bottom"].set_visible(False)
+    ax_bot.spines["top"].set_visible(False)
+    ax_top.tick_params(axis="x", bottom=False)
+    for ax in (ax_top, ax_bot):
+        widen_bars(ax)
+    break_marks(ax_top, ax_bot)
+
+    if title:
+        ax_top.set_title(title, **TITLE_STYLE)
+    ax_top.set_xlabel("")
+    ax_bot.set_xlabel(xlabel or "", fontsize=AXIS_FONTSIZE)
+    ax_top.set_ylabel("")
+    ax_bot.set_ylabel(ylabel or "", fontsize=AXIS_FONTSIZE)
+    if path is not None:
+        # tight_layout() would reset the narrow gap between the two axes.
+        save_fig(fig, path, tight=False)
+        return None
+    return ax_top, ax_bot
+
+
+def stacked_bar_plot(pivot, colors=None, figsize=(15, 6), width=0.8, title=None,
+                     xlabel=None, ylabel=None, xticklabels=None, rotation=90,
+                     tick_fontsize=TICK_FONTSIZE, legend_title="State",
+                     legend_fontsize=LEGEND_FONTSIZE, path=None):
+    """Stacked bars of a fraction table, with the row totals outlined.
+
+    *pivot* is indexed by the bars (dataset or method) and its columns are the
+    components, stacked in column order and coloured by *colors*. The outline
+    of the row sums is what shows how much of the genome a segmentation covers
+    at all, which the stack alone hides. *xticklabels* takes the same forms as
+    in bar_plot(), "group" included.
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+    widen_bars(ax)
+    pivot.plot(kind="bar", stacked=True, ax=ax, width=width, color=colors, linewidth=0)
+    # Drawn after the stack so ax.legend() below picks up the components only.
+    pivot.sum(axis=1).plot(kind="bar", ax=ax, width=width, facecolor="none",
+                           edgecolor=BAR_STYLE["edgecolor"], linewidth=BAR_STYLE["linewidth"], legend=False)
+    if title:
+        ax.set_title(title, **TITLE_STYLE)
+    ax.legend(title=legend_title, fontsize=legend_fontsize, title_fontsize=LEGEND_TITLE_FONTSIZE,
+              bbox_to_anchor=(1.01, 1), loc="upper left")
+    ax.set_xlabel(xlabel or "", fontsize=AXIS_FONTSIZE)
+    ax.set_ylabel(ylabel or "", fontsize=AXIS_FONTSIZE)
+    if xticklabels is not None:
+        levels = list(pivot.index)
+        ax.set_xticks(range(len(levels)))
+        ax.set_xticklabels(_xticklabels(levels, xticklabels), rotation=rotation,
+                           ha="right" if rotation not in (0, 90) else "center",
+                           fontsize=tick_fontsize)
+    else:
+        ax.tick_params(axis="x", rotation=rotation, labelsize=tick_fontsize)
+    ax.tick_params(axis="y", labelsize=tick_fontsize)
+    ax.grid(axis="y", alpha=0.3)
+    if path is not None:
+        save_fig(fig, path)
+        return None
+    return ax
+
+
+def sample_pairs(pairs, limit=1000, seed=42):
+    """At most *limit* of *pairs*, sampled reproducibly and sorted.
+
+    The pairwise consistency of a hundred segmentations is tens of thousands of
+    pairs, which the notebooks read off a sample of. Sorting the sample keeps
+    it lined up with a cached list of overlaps computed from the same call.
+    """
+    pairs = list(pairs)
+    if len(pairs) <= limit:
+        return pairs
+    return sorted(random.Random(seed).sample(pairs, limit))
+
+
+# A bar is BAR_INCHES[1] wide on a chart of up to BAR_FEW bars, narrowing as
+# (n / BAR_FEW) ** -BAR_SHRINK down to BAR_INCHES[0] for the busiest ones: a
+# 4-bar and a 40-bar chart stay within 2.3x of each other in bar width
+# instead of the 10x a fixed figure width gives. Bars dodged into touching
+# clusters are sized by cluster instead: a cluster of k bars is as wide as
+# sqrt(k) lone bars of a chart with that many clusters, so its bars get
+# thinner, down to BAR_CLUSTER_INCHES, and the clusters stay close together.
+# An axes is never narrower than BAR_AXES_INCHES[0], padding the x range
+# around a lone bar instead, nor wider than BAR_AXES_INCHES[1], where the bars
+# of the widest charts get thinner.
+BAR_INCHES = (0.22, 0.5)
+BAR_FEW = 4
+BAR_SHRINK = 0.35
+BAR_CLUSTER_INCHES = 0.12
+BAR_AXES_INCHES = (1.5, 20.0)
+# State composition charts, whose thin state slices need the room, are drawn
+# COMPOSITION_WIDEN times wider than that, their axes cap included.
+COMPOSITION_WIDEN = 1.3
+
+
+def bar_inches(n_bars, cluster=1):
+    """Physical width of one bar on a chart of *n_bars* bars, dodged into
+    clusters of *cluster* touching bars."""
+    low, high = BAR_INCHES
+    n_groups = -(-max(n_bars, 1) // max(cluster, 1))
+    inches = float(np.clip(high * (n_groups / BAR_FEW) ** -BAR_SHRINK, low, high))
+    if cluster <= 1:
+        return inches
+    return max(inches / np.sqrt(cluster), BAR_CLUSTER_INCHES)
+
+
+def _bar_geometry(ax):
+    """(bars, bars per cluster, bar width in x units) of the vertical bars of
+    *ax*, or None.
+
+    Bars are counted by position, so a stack or an outline over the stack is
+    one bar. A cluster is a run of bars that touch, which is what a dodged
+    chart draws; a missing hue level splits one, so the largest is its size.
+    """
+    patches = [p for c in ax.containers if isinstance(c, BarContainer)
+               and getattr(c, "orientation", "vertical") != "horizontal"
+               for p in c.patches]
+    widths = [p.get_width() for p in patches if p.get_width() > 0]
+    if not widths:
+        return None
+    width = float(np.median(widths))
+    centres = sorted({round(p.get_x() + p.get_width() / 2, 6) for p in patches})
+    cluster, run = 1, 1
+    for left, right in zip(centres, centres[1:]):
+        run = run + 1 if right - left <= width * 1.05 else 1
+        cluster = max(cluster, run)
+    return len(centres), cluster, width
+
+
+def widen_bars(ax, factor=COMPOSITION_WIDEN):
+    """Have fit_bar_widths() draw the bars of *ax* *factor* times wider."""
+    ax._bar_widen = factor
+    return ax
+
+
+def _bar_axes(fig):
+    """{axes: (bar inches, bar width in x units, widen factor)} of the bar
+    charts of *fig*."""
+    found = {}
+    for ax in fig.axes:
+        geometry = _bar_geometry(ax)
+        if geometry is not None:
+            n_bars, cluster, width = geometry
+            widen = getattr(ax, "_bar_widen", 1.0)
+            found[ax] = (bar_inches(n_bars, cluster) * widen, width, widen)
+    return found
+
+
+def fit_bar_widths(fig, tight=True, rounds=8, tolerance=0.03):
+    """Resize the width of *fig* so its bars come out bar_inches() wide.
+
+    With *tight* the layout is re-run every round, whose margins stay put in
+    inches, so the figure grows by what the bars lack; without it the axes keep
+    their share of the figure, which scales instead. Every row of axes gets
+    its bars at least that wide; an axes left wider than its bars need - a lone
+    bar, a row with fewer bars than the widest one - pads its x range.
+    """
+    bars = _bar_axes(fig)
+    if not bars:
+        if tight:
+            fig.tight_layout()
+        return
+
+    def need(ax):
+        inches, width, widen = bars[ax]
+        lo, hi = ax.get_xlim()
+        low, high = BAR_AXES_INCHES
+        return float(np.clip(inches * (hi - lo) / width, low, high * widen))
+
+    for _ in range(rounds):
+        if tight:
+            fig.tight_layout()
+        fig_width = fig.get_figwidth()
+        have = {ax: ax.get_position().width * fig_width for ax in bars}
+        rows = {}
+        for ax in bars:
+            pos = ax.get_position()
+            row = (round(pos.y0, 3), round(pos.y1, 3))
+            rows[row] = rows.get(row, 0.0) + need(ax) - have[ax]
+        delta = max(rows.values())
+        if abs(delta) < tolerance * fig_width:
+            break
+        if tight:
+            fig.set_figwidth(max(fig_width + delta, 1.0))
+        else:
+            fig.set_figwidth(fig_width * max(need(ax) / have[ax] for ax in bars))
+
+    fig_width = fig.get_figwidth()
+    for ax, (inches, width, _) in bars.items():
+        have = ax.get_position().width * fig_width
+        lo, hi = ax.get_xlim()
+        span = have * width / inches
+        if span > (hi - lo) * (1 + tolerance):
+            mid = (lo + hi) / 2
+            ax.set_xlim(mid - span / 2, mid + span / 2)
+
+
+def save_fig(fig, path, tight=True, note=None, bar_width=True, **kwargs):
+    """Write *fig* to *path*, then close it and report the file.
+
+    *tight* runs tight_layout() first — pass False for a figure that manages
+    its own layout. A figure with vertical bars is resized by fit_bar_widths()
+    unless *bar_width* is False, so a bar is about as wide on every chart.
+    Extra keywords go to fig.savefig().
+    """
+    if bar_width:
+        fit_bar_widths(fig, tight=tight)
+    elif tight:
+        fig.tight_layout()
+    kwargs.setdefault("bbox_inches", "tight")
+    kwargs.setdefault("dpi", FIGURE_DPI)
+    _save(path, lambda p: fig.savefig(p, **kwargs))
+    plt.close(fig)
+    print(f"  saved {path}{' ' + note if note else ''}")
+
+
+def load_matrix(path):
+    """Read a seg × seg matrix TSV into a DataFrame; None when it is missing."""
+    if not os.path.exists(path):
+        return None
+    df = pd.read_csv(path, sep="\t", index_col=0)
+    df.index = df.index.astype(str).str.strip()
+    df.columns = df.columns.astype(str).str.strip()
+    return df
+
+
+def cached_pickle(path, compute, label=None, valid=None):
+    """Result of compute(), cached as a pickle in *path*.
+
+    The cache is reused when it exists and *valid* — an optional predicate on
+    the loaded value — accepts it; otherwise compute() runs and is written back.
+    """
+    what = label or os.path.basename(path)
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            value = pickle.load(f)
+        if valid is None or valid(value):
+            print(f"Loaded cached {what} from {path}")
+            return value
+        print(f"Cached {what} in {path} no longer matches the inputs, recomputing...")
+    else:
+        print(f"Computing {what}...")
+    value = compute()
+    _save(path, lambda p: _dump_pickle(p, value))
+    print(f"Saved {what} to {path}")
+    return value
+
+
+def cached_csv(path, compute, label=None, index=False, valid=None, **read_kwargs):
+    """DataFrame returned by compute(), cached as CSV in *path*.
+
+    Same contract as cached_pickle(); *read_kwargs* go to pd.read_csv, and its
+    *sep* is written back too, so a tab-separated cache reads as it was written.
+    """
+    what = label or os.path.basename(path)
+    if os.path.exists(path):
+        df = pd.read_csv(path, **read_kwargs)
+        if valid is None or valid(df):
+            print(f"Loaded cached {what} from {path}")
+            return df
+        print(f"Cached {what} in {path} no longer matches the inputs, recomputing...")
+    print(f"Computing {what}...")
+    df = compute()
+    sep = read_kwargs.get("sep") or ","
+    _save(path, lambda p: df.to_csv(p, index=index, sep=sep))
+    print(f"Saved {what} to {path}")
+    return df
+
+
+def cached_json(path, compute, label=None, valid=None):
+    """Result of compute(), cached as JSON in *path*.
+
+    Same contract as cached_pickle(), for a value a plain JSON object holds -
+    the state colour maps of the notebooks.
+    """
+    what = label or os.path.basename(path)
+    if os.path.exists(path):
+        with open(path) as f:
+            value = json.load(f)
+        if valid is None or valid(value):
+            print(f"Loaded cached {what} from {path}")
+            return value
+        print(f"Cached {what} in {path} no longer matches the inputs, recomputing...")
+    else:
+        print(f"Computing {what}...")
+    value = compute()
+    _save(path, lambda p: _dump_json(p, value))
+    print(f"Saved {what} to {path}")
+    return value
+
+
+def file_stamp(path):
+    """(mtime, size) identifying *path*, None when missing.
+
+    A list, not a tuple, so a signature built from it survives a JSON round trip.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return [st.st_mtime_ns, st.st_size]
+
+
+def stamp_current(stamp_path, signature, outputs=()):
+    """True when *stamp_path* records exactly *signature* and *outputs* exist.
+
+    For steps whose result is a set of files; any missing output invalidates the
+    stamp, so deleting a result forces a rerun.
+    """
+    if any(not os.path.exists(o) for o in outputs):
+        return False
+    try:
+        with open(stamp_path) as f:
+            return json.load(f) == signature
+    except (OSError, ValueError):
+        return False
+
+
+def save_stamp(stamp_path, signature):
+    _save(stamp_path, lambda p: _dump_json(p, signature))
+
+
+def _save(path, write):
+    """Run write(path) with the parent directory of *path* in place."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    write(path)
+
+
+def _dump_pickle(path, value):
+    with open(path, "wb") as f:
+        pickle.dump(value, f)
+
+
+def _dump_json(path, value):
+    with open(path, "w") as f:
+        json.dump(value, f, indent=1)

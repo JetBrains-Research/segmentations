@@ -1,0 +1,517 @@
+import gzip
+import os
+import subprocess
+import tempfile
+import numpy as np
+import pandas as pd
+import pytest
+
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "analysis")))
+
+import analyze_peaks
+
+
+def test_fast_count_marks():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create uncompressed binary file
+        txt_path = os.path.join(tmpdir, "test_binary.txt")
+        lines = [
+            "cell1\tchr1\n",
+            "H3K4me3\tH3K27ac\tH3K4me1\n",
+            "0\t0\t0\n",  # 0 marks
+            "1\t0\t0\n",  # 1 mark
+            "1\t1\t0\n",  # 2 marks
+            "1\t1\t1\n",  # 3 marks
+            "0\t1\t0\n",  # 1 mark
+        ]
+        with open(txt_path, "w") as f:
+            f.writelines(lines)
+
+        counts = analyze_peaks.fast_count_marks(txt_path)
+        # 0 marks: 1, 1 mark: 2, 2 marks: 1, 3 marks: 1
+        assert len(counts) == 4
+        assert counts[0] == 1
+        assert counts[1] == 2
+        assert counts[2] == 1
+        assert counts[3] == 1
+
+        # Create gzipped binary file
+        gz_path = os.path.join(tmpdir, "test_binary.txt.gz")
+        with gzip.open(gz_path, "wt") as f:
+            f.writelines(lines)
+
+        counts_gz = analyze_peaks.fast_count_marks(gz_path)
+        assert np.array_equal(counts, counts_gz)
+
+
+def test_binarization_mark_coverage_and_plot():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ds = "sample1"
+        cell = "SampleCell"
+        ds_dir = os.path.join(tmpdir, ds)
+        # ChromHMM default dir
+        ch_dir = os.path.join(ds_dir, "chromhmm_default")
+        os.makedirs(ch_dir, exist_ok=True)
+        ch_file = os.path.join(ch_dir, f"{cell}_chr1_binary.txt")
+        lines_ch = [
+            f"{cell}\tchr1\n",
+            "H3K4me3\tH3K27ac\tH3K4me1\n",
+            "0\t0\t0\n",
+            "1\t0\t0\n",
+            "1\t1\t0\n",
+            "1\t1\t1\n",
+        ]
+        with open(ch_file, "w") as f:
+            f.writelines(lines_ch)
+
+        # OmniPeak dir
+        omni_dir = os.path.join(ds_dir, "omni", "chromhmm_peaks")
+        os.makedirs(omni_dir, exist_ok=True)
+        omni_file = os.path.join(omni_dir, "chr1_binary.txt.gz")
+        lines_omni = [
+            f"{cell}\tchr1\n",
+            "H3K4me3\tH3K27ac\tH3K4me1\n",
+            "1\t0\t0\n",
+            "1\t1\t0\n",
+            "1\t1\t1\n",
+            "1\t1\t1\n",
+        ]
+        with gzip.open(omni_file, "wt") as f:
+            f.writelines(lines_omni)
+
+        df = analyze_peaks.binarization_mark_coverage(
+            ds, cell, methods=["ChromHMM", "OmniPeak"], workdir=tmpdir
+        )
+        assert not df.empty
+        assert set(df["method"]) == {"ChromHMM", "OmniPeak"}
+        assert set(df["N"]) == {1, 2, 3}
+
+        # Check normalization at N=1
+        for m in ["ChromHMM", "OmniPeak"]:
+            sub = df[(df["method"] == m) & (df["N"] == 1)]
+            assert sub["fraction"].iloc[0] == 1.0
+
+        # Plot absolute and relative separately
+        plot_abs_path = os.path.join(tmpdir, "plot_abs.pdf")
+        fig_abs, ax_abs = analyze_peaks.plot_mark_coverage_absolute(df, outfile=plot_abs_path)
+        assert fig_abs is not None
+        assert ax_abs is not None
+        assert os.path.exists(plot_abs_path)
+        assert ax_abs.get_yscale() == "log"
+
+        plot_rel_path = os.path.join(tmpdir, "plot_rel.pdf")
+        fig_rel, ax_rel = analyze_peaks.plot_mark_coverage_relative(df, outfile=plot_rel_path)
+        assert fig_rel is not None
+        assert ax_rel is not None
+        assert os.path.exists(plot_rel_path)
+        assert ax_rel.get_yscale() == "linear"
+
+        # Test summary_plots integration with mark_coverage_outfile
+        import summary_plots
+        summary_out = os.path.join(tmpdir, "summary_cov.pdf")
+        summary_plots.run_summary_plots(
+            datasets=[ds],
+            cells=[cell],
+            workdir=tmpdir,
+            mark_coverage_outfile=summary_out
+        )
+        assert os.path.exists(summary_out)
+
+        # Test summary_plots integration with outdir (same folder as summary_2way_tss_exptss.pdf)
+        summary_dir = os.path.join(tmpdir, "summary_plots")
+        analysis_dir = os.path.join(tmpdir, "analysis_dir")
+        os.makedirs(analysis_dir, exist_ok=True)
+        # Create dummy comparison table
+        comp_df = pd.DataFrame([{"method": "chromhmm_default", "display_name": "Default ChromHMM",
+                                 "binarization": "default", "state_model": "chromhmm", "replicate": None,
+                                 "sensitivity_Tss_ExpressedTSS2kb": 0.5, "coverage_Tss_ExpressedTSS2kb": 0.5}])
+        comp_df.to_csv(os.path.join(analysis_dir, "comparison_table.tsv"), sep="\t", index=False)
+
+        summary_plots.run_summary_plots(
+            datasets=[ds],
+            methods_dirs=[analysis_dir],
+            analysis_dirs=[analysis_dir],
+            outdir=summary_dir,
+            workdir=tmpdir,
+            cells=[cell]
+        )
+        assert os.path.exists(os.path.join(summary_dir, "summary_2way_tss_exptss.pdf"))
+        assert os.path.exists(os.path.join(summary_dir, "binarization_mark_coverage_absolute.pdf"))
+        assert os.path.exists(os.path.join(summary_dir, "binarization_mark_coverage_relative.pdf"))
+        assert os.path.exists(os.path.join(summary_dir, "binarization_mark_combinations.pdf"))
+
+
+def test_binarization_mark_coverage_replicates():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ds = "rep_sample"
+        cell = "MCF7"
+        ds_dir = os.path.join(tmpdir, ds)
+        # Replicate 1 ChromHMM dir
+        ch_dir = os.path.join(ds_dir, "rep1", "chromhmm_default")
+        os.makedirs(ch_dir, exist_ok=True)
+        ch_file = os.path.join(ch_dir, f"{cell}_chr1_binary.txt")
+        lines_ch = [
+            f"{cell}\tchr1\n",
+            "H3K4me3\tH3K27ac\tH3K4me1\n",
+            "0\t0\t0\n",
+            "1\t0\t0\n",
+            "1\t1\t0\n",
+            "1\t1\t1\n",
+        ]
+        with open(ch_file, "w") as f:
+            f.writelines(lines_ch)
+
+        # Replicate 2 OmniPeak dir
+        omni_dir = os.path.join(ds_dir, "rep2", "omni", "chromhmm_peaks")
+        os.makedirs(omni_dir, exist_ok=True)
+        omni_file = os.path.join(omni_dir, "chr1_binary.txt.gz")
+        lines_omni = [
+            f"{cell}\tchr1\n",
+            "H3K4me3\tH3K27ac\tH3K4me1\n",
+            "1\t0\t0\n",
+            "1\t1\t0\n",
+            "1\t1\t1\n",
+        ]
+        with gzip.open(omni_file, "wt") as f:
+            f.writelines(lines_omni)
+
+        df = analyze_peaks.binarization_mark_coverage(
+            ds, cell, methods=["ChromHMM", "OmniPeak"], workdir=tmpdir
+        )
+        assert not df.empty
+        assert set(df["method"]) == {"ChromHMM", "OmniPeak"}
+        assert set(df["N"]) == {1, 2, 3}
+
+        # Test summary_plots with replicate structure
+        import summary_plots
+        summary_dir = os.path.join(tmpdir, "out", "summary_plots")
+        os.makedirs(summary_dir, exist_ok=True)
+        summary_plots._plot_mark_coverage(
+            [ds], tmpdir, os.path.join(summary_dir, "binarization_mark_coverage_absolute.pdf"),
+            cells={ds: cell}, relative=False
+        )
+        assert os.path.exists(os.path.join(summary_dir, "binarization_mark_coverage_absolute.pdf"))
+
+        # Test summary_plots._plot_mark_coverage with DataFrame directly
+        df_out = os.path.join(summary_dir, "df_cov_rel.pdf")
+        summary_plots._plot_mark_coverage(df, tmpdir, df_out, relative=True)
+        assert os.path.exists(df_out)
+
+
+def test_binarization_mark_coverage_chromhmm_binary_and_peak_fallback():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ds = "E001"
+        cell = "E001"
+        ds_dir = os.path.join(tmpdir, ds)
+        # ChromHMM in chromhmm_binary folder
+        ch_dir = os.path.join(ds_dir, "chromhmm_binary")
+        os.makedirs(ch_dir, exist_ok=True)
+        ch_file = os.path.join(ch_dir, f"{cell}_chr1_binary.txt.gz")
+        lines_ch = [
+            f"{cell}\tchr1\n",
+            "H3K4me3\tH3K27ac\tH3K4me1\n",
+            "0\t0\t0\n",
+            "1\t0\t0\n",
+            "1\t1\t0\n",
+            "1\t1\t1\n",
+        ]
+        with gzip.open(ch_file, "wt") as f:
+            f.writelines(lines_ch)
+
+        # HOMER raw peak files
+        homer_dir = os.path.join(ds_dir, "homer")
+        os.makedirs(homer_dir, exist_ok=True)
+        with open(os.path.join(homer_dir, f"{cell}-H3K4me3_homer.bed"), "w") as f:
+            f.write("chr1\t100\t200\nchr1\t300\t400\n")
+        with open(os.path.join(homer_dir, f"{cell}-H3K27ac_homer.bed"), "w") as f:
+            f.write("chr1\t150\t250\n")
+
+        # Mock chrom.sizes
+        chromsizes_path = os.path.join(tmpdir, "hg19.chrom.sizes")
+        with open(chromsizes_path, "w") as f:
+            f.write("chr1\t1000\n")
+
+        df = analyze_peaks.binarization_mark_coverage(
+            ds, cell, methods=["ChromHMM", "HOMER"], workdir=tmpdir
+        )
+        assert not df.empty
+        assert set(df["method"]) == {"ChromHMM", "HOMER"}
+        assert 1 in df[df["method"] == "ChromHMM"]["N"].values
+        assert 1 in df[df["method"] == "HOMER"]["N"].values
+
+
+def test_binarization_mark_combinations_and_plot():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ds = "sample1"
+        cell = "SampleCell"
+        ds_dir = os.path.join(tmpdir, ds)
+        # ChromHMM default dir
+        ch_dir = os.path.join(ds_dir, "chromhmm_default")
+        os.makedirs(ch_dir, exist_ok=True)
+        ch_file = os.path.join(ch_dir, f"{cell}_chr1_binary.txt")
+        lines_ch = [
+            f"{cell}\tchr1\n",
+            "H3K4me3\tH3K27ac\tH3K4me1\n",
+            "0\t0\t0\n",  # 0
+            "1\t0\t0\n",  # N=1, mask 1
+            "0\t1\t0\n",  # N=1, mask 2
+            "1\t1\t0\n",  # N=2, mask 3
+            "1\t1\t1\n",  # N=3, mask 7
+        ]
+        with open(ch_file, "w") as f:
+            f.writelines(lines_ch)
+
+        # OmniPeak dir
+        omni_dir = os.path.join(ds_dir, "omni", "chromhmm_peaks")
+        os.makedirs(omni_dir, exist_ok=True)
+        omni_file = os.path.join(omni_dir, "chr1_binary.txt.gz")
+        lines_omni = [
+            f"{cell}\tchr1\n",
+            "H3K4me3\tH3K27ac\tH3K4me1\n",
+            "1\t0\t0\n",  # N=1, mask 1
+            "1\t0\t0\n",  # duplicate mask 1
+            "1\t1\t0\n",  # N=2, mask 3
+            "0\t1\t1\n",  # N=2, mask 6
+            "1\t1\t1\n",  # N=3, mask 7
+        ]
+        with gzip.open(omni_file, "wt") as f:
+            f.writelines(lines_omni)
+
+        m_ch, masks_ch = analyze_peaks.fast_get_combinations(ch_file)
+        assert m_ch == 3
+        assert masks_ch == {0, 1, 2, 3, 7}
+
+        m_omni, masks_omni = analyze_peaks.fast_get_combinations(omni_file)
+        assert m_omni == 3
+        assert masks_omni == {1, 3, 6, 7}
+
+        df = analyze_peaks.binarization_mark_combinations(
+            ds, cell, methods=["ChromHMM", "OmniPeak"], workdir=tmpdir
+        )
+        assert not df.empty
+        assert set(df["method"]) == {"ChromHMM", "OmniPeak"}
+        assert set(df["N"]) == {1, 2, 3}
+
+        # Check ChromHMM combination counts: N=1 -> 2 (masks 1, 2), N=2 -> 1 (mask 3), N=3 -> 1 (mask 7)
+        ch_sub = df[df["method"] == "ChromHMM"].set_index("N")["combinations"]
+        assert ch_sub[1] == 2
+        assert ch_sub[2] == 1
+        assert ch_sub[3] == 1
+
+        # Check OmniPeak combination counts: N=1 -> 1 (mask 1), N=2 -> 2 (masks 3, 6), N=3 -> 1 (mask 7)
+        omni_sub = df[df["method"] == "OmniPeak"].set_index("N")["combinations"]
+        assert omni_sub[1] == 1
+        assert omni_sub[2] == 2
+        assert omni_sub[3] == 1
+
+        # Plot combinations
+        plot_comb_path = os.path.join(tmpdir, "binarization_mark_combinations.pdf")
+        fig, ax = analyze_peaks.plot_mark_combinations(df, outfile=plot_comb_path)
+        assert fig is not None
+        assert ax is not None
+        assert os.path.exists(plot_comb_path)
+
+        # Test summary_plots._plot_mark_combinations
+        import summary_plots
+        summary_out = os.path.join(tmpdir, "summary_comb.pdf")
+        summary_plots._plot_mark_combinations(
+            [ds], tmpdir, summary_out, cells={ds: cell}
+        )
+        assert os.path.exists(summary_out)
+
+
+def test_read_chrom_sizes_robustness():
+    import peaks_segmentation
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        chromsizes_path = os.path.join(tmpdir, "test.chrom.sizes")
+        with open(chromsizes_path, "w") as f:
+            f.write("# comment line\n")
+            f.write("chr1\t1000\n")
+            f.write("chr2\t2000a\n")
+            f.write("chr3_random\t500\n")
+            f.write("chr4   4000\n")
+
+        chroms, sizes = peaks_segmentation.read_chrom_sizes(chromsizes_path)
+        assert chroms == ["chr1", "chr2", "chr4"]
+        assert sizes == {"chr1": 1000, "chr2": 2000, "chr4": 4000}
+        assert all(isinstance(v, int) for v in sizes.values())
+
+
+def test_peaks_segmentation_kmeans():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cs_path = os.path.join(tmpdir, "chrom.sizes")
+        with open(cs_path, "w") as f:
+            f.write("chr1\t1000\nchr2\t1000\n")
+
+        p_m1 = os.path.join(tmpdir, "p_m1.bed")
+        p_m2 = os.path.join(tmpdir, "p_m2.bed")
+
+        with open(p_m1, "w") as f:
+            f.write("chr1\t0\t200\nchr2\t100\t400\n")
+        with open(p_m2, "w") as f:
+            f.write("chr1\t100\t300\nchr2\t200\t500\n")
+
+        outbed = os.path.join(tmpdir, "out_kmeans.bed")
+
+        cmd = [
+            sys.executable,
+            os.path.join(os.path.dirname(__file__), "..", "scripts", "rules", "peaks_segmentation.py"),
+            "--bin", "100",
+            "--chromsizes", cs_path,
+            "--marks", "H3K4me3,H3K27ac",
+            "--peaks", p_m1, p_m2,
+            "--states", "3",
+            "--out", outbed,
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        assert res.returncode == 0, f"Error: {res.stderr}"
+        assert os.path.exists(outbed)
+        with open(outbed) as f:
+            lines = f.readlines()
+        assert len(lines) > 0
+        for line in lines:
+            parts = line.strip().split("\t")
+            assert len(parts) == 9
+            assert parts[0] in ["chr1", "chr2"]
+            assert parts[3].startswith("E")
+
+
+def test_peaks_segmentation_fewer_patterns_than_states():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cs_path = os.path.join(tmpdir, "chrom.sizes")
+        with open(cs_path, "w") as f:
+            f.write("chr1\t1000\nchr2\t1000\n")
+
+        p_m1 = os.path.join(tmpdir, "p_m1.bed")
+        p_m2 = os.path.join(tmpdir, "p_m2.bed")
+
+        with open(p_m1, "w") as f:
+            f.write("chr1\t0\t200\nchr2\t100\t400\n")
+        with open(p_m2, "w") as f:
+            f.write("chr1\t100\t300\nchr2\t200\t500\n")
+
+        outbed = os.path.join(tmpdir, "out_kmeans_15.bed")
+
+        # Request 15 states with only 2 marks (at most 4 distinct patterns)
+        cmd = [
+            sys.executable,
+            os.path.join(os.path.dirname(__file__), "..", "scripts", "rules", "peaks_segmentation.py"),
+            "--bin", "100",
+            "--chromsizes", cs_path,
+            "--marks", "H3K4me3,H3K27ac",
+            "--peaks", p_m1, p_m2,
+            "--states", "15",
+            "--out", outbed,
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        assert res.returncode == 0, f"Error: {res.stderr}"
+        assert os.path.exists(outbed)
+        with open(outbed) as f:
+            lines = f.readlines()
+        assert len(lines) > 0
+        for line in lines:
+            parts = line.strip().split("\t")
+            assert len(parts) == 9
+            assert parts[0] in ["chr1", "chr2"]
+            assert parts[3].startswith("E")
+
+
+def test_joint_peaks_segmentation_kmeans():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cs_path = os.path.join(tmpdir, "chrom.sizes")
+        with open(cs_path, "w") as f:
+            f.write("chr1\t1000\nchr2\t1000\n")
+
+        p_c1_m1 = os.path.join(tmpdir, "p_c1_m1.bed")
+        p_c1_m2 = os.path.join(tmpdir, "p_c1_m2.bed")
+        p_c2_m1 = os.path.join(tmpdir, "p_c2_m1.bed")
+        p_c2_m2 = os.path.join(tmpdir, "p_c2_m2.bed")
+
+        with open(p_c1_m1, "w") as f:
+            f.write("chr1\t0\t200\nchr2\t100\t400\n")
+        with open(p_c1_m2, "w") as f:
+            f.write("chr1\t100\t300\nchr2\t200\t500\n")
+        with open(p_c2_m1, "w") as f:
+            f.write("chr1\t50\t250\nchr2\t150\t450\n")
+        with open(p_c2_m2, "w") as f:
+            f.write("chr1\t150\t350\nchr2\t250\t550\n")
+
+        outbed1 = os.path.join(tmpdir, "c1_kmeans.bed")
+        outbed2 = os.path.join(tmpdir, "c2_kmeans.bed")
+
+        cmd = [
+            sys.executable,
+            os.path.join(os.path.dirname(__file__), "..", "scripts", "rules", "joint_peaks_segmentation.py"),
+            "--bin", "100",
+            "--chromsizes", cs_path,
+            "--marks", "H3K4me3,H3K27ac",
+            "--cells", "c1,c2",
+            "--peaks", p_c1_m1, p_c1_m2, p_c2_m1, p_c2_m2,
+            "--states", "3",
+            "--outbeds", outbed1, outbed2,
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        assert res.returncode == 0, f"Error: {res.stderr}"
+        assert os.path.exists(outbed1)
+        assert os.path.exists(outbed2)
+        for outbed in [outbed1, outbed2]:
+            with open(outbed) as f:
+                lines = f.readlines()
+            assert len(lines) > 0
+            for line in lines:
+                parts = line.strip().split("\t")
+                assert len(parts) == 9
+                assert parts[0] in ["chr1", "chr2"]
+                assert parts[3].startswith("E")
+
+
+def test_joint_peaks_segmentation_fewer_patterns_than_states():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cs_path = os.path.join(tmpdir, "chrom.sizes")
+        with open(cs_path, "w") as f:
+            f.write("chr1\t1000\nchr2\t1000\n")
+
+        p_c1_m1 = os.path.join(tmpdir, "p_c1_m1.bed")
+        p_c1_m2 = os.path.join(tmpdir, "p_c1_m2.bed")
+        p_c2_m1 = os.path.join(tmpdir, "p_c2_m1.bed")
+        p_c2_m2 = os.path.join(tmpdir, "p_c2_m2.bed")
+
+        with open(p_c1_m1, "w") as f:
+            f.write("chr1\t0\t200\nchr2\t100\t400\n")
+        with open(p_c1_m2, "w") as f:
+            f.write("chr1\t100\t300\nchr2\t200\t500\n")
+        with open(p_c2_m1, "w") as f:
+            f.write("chr1\t50\t250\nchr2\t150\t450\n")
+        with open(p_c2_m2, "w") as f:
+            f.write("chr1\t150\t350\nchr2\t250\t550\n")
+
+        outbed1 = os.path.join(tmpdir, "c1_kmeans.bed")
+        outbed2 = os.path.join(tmpdir, "c2_kmeans.bed")
+
+        # Request 15 states with only 2 marks (at most 4 distinct patterns)
+        cmd = [
+            sys.executable,
+            os.path.join(os.path.dirname(__file__), "..", "scripts", "rules", "joint_peaks_segmentation.py"),
+            "--bin", "100",
+            "--chromsizes", cs_path,
+            "--marks", "H3K4me3,H3K27ac",
+            "--cells", "c1,c2",
+            "--peaks", p_c1_m1, p_c1_m2, p_c2_m1, p_c2_m2,
+            "--states", "15",
+            "--outbeds", outbed1, outbed2,
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        assert res.returncode == 0, f"Error: {res.stderr}"
+        assert os.path.exists(outbed1)
+        assert os.path.exists(outbed2)
+        for outbed in [outbed1, outbed2]:
+            with open(outbed) as f:
+                lines = f.readlines()
+            assert len(lines) > 0
+            for line in lines:
+                parts = line.strip().split("\t")
+                assert len(parts) == 9
+                assert parts[0] in ["chr1", "chr2"]
+                assert parts[3].startswith("E")

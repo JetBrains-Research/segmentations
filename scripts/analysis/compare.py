@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+# Cross-segmentation comparison: entropy, kappa, Jaccard, segment stats.
+
+import os
+import sys
+from collections import defaultdict
+from types import SimpleNamespace
+
+import matplotlib
+import numpy as np
+import pandas as pd
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+_analysis_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "analysis"))
+if _analysis_dir not in sys.path:
+    sys.path.insert(0, _analysis_dir)
+
+from analyze import (load_bed, _natural_sort_key, _load_seg_full,
+                     build_transition_matrix, transition_entropy,
+                     segments_to_codes)
+
+_rules_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "rules"))
+if _rules_dir not in sys.path:
+    sys.path.insert(0, _rules_dir)
+
+import match
+import utils
+from utils import seg_label as _seg_label, is_replicate as _is_replicate, \
+                   should_compare as _should_compare, \
+                   is_rep_pair as _is_rep_pair, display_name, \
+                   method_color, save_fig, \
+                   JACCARD, KAPPA, \
+                   JACCARD_DISPLAY, KAPPA_DISPLAY, \
+                   BAR_STYLE, TITLE_STYLE, AXIS_FONTSIZE, TICK_FONTSIZE, LEGEND_FONTSIZE, \
+                   LEGEND_TITLE_FONTSIZE, LABEL_FONTSIZE, ANNOTATION_FONTSIZE
+
+utils.set_style()
+
+
+def _build_seg_to_analysis_map(seg_paths, analysis_dir):
+    """Return {seg_path: analysis subdir}.
+
+    Pooled methods live directly in analysis_dir; replicates live in
+    {ds}/repN/analysis/{variant}/{method_base}/, where the variant is the
+    basename of analysis_dir (comb/bwem/ovlp).
+    """
+    if not analysis_dir or not os.path.isdir(analysis_dir):
+        return {}
+    variant = os.path.basename(analysis_dir)
+    available = set(os.listdir(analysis_dir))
+    mapping = {}
+    for seg_path in seg_paths:
+        label = _seg_label(seg_path)
+        if label.startswith("ENCFF"):
+            if "ref" in available:
+                mapping[seg_path] = os.path.join(analysis_dir, "ref")
+        elif label in available:
+            mapping[seg_path] = os.path.join(analysis_dir, label)
+        elif _is_replicate(label):
+            parts = seg_path.replace("\\", "/").split("/")
+            ds = parts[0]
+            rep = next((p for p in parts if p in ("rep1", "rep2", "replicate1", "replicate2")), None)
+            method_base = label.rsplit("_", 1)[0]
+            if rep:
+                rep_dir = os.path.join(ds, rep, "analysis", variant, method_base)
+                if os.path.isdir(rep_dir):
+                    mapping[seg_path] = rep_dir
+    return mapping
+
+
+def _compute_entropy(seg_paths, bin_sizes):
+    """Transition entropy totals: [{segmentation, total_entropy}, ...].
+
+    bin_sizes: one bin size per segmentation, parallel to seg_paths.
+    """
+    results = []
+    for seg_path, bin_size in zip(seg_paths, bin_sizes):
+        segs = load_bed(seg_path)
+        if not segs:
+            print(f"  WARNING: empty segmentation {seg_path}", file=sys.stderr)
+            continue
+        states, counts, state_bp = build_transition_matrix(segs, bin_size)
+        total_H, _, _, _ = transition_entropy(states, counts, state_bp)
+        label = _seg_label(seg_path)
+        results.append({"segmentation": label, "total_entropy": total_H})
+        print(f"  {label}: total transition entropy = {total_H:.4f}")
+    return results
+
+
+def _get_method_style(label):
+    """(display_name, color) for a segmentation label."""
+    return display_name(label), method_color(label)
+
+
+def _save_entropy_summary(results, outdir):
+    """Entropy summary TSV and bar chart."""
+    if not results:
+        return
+    os.makedirs(outdir, exist_ok=True)
+    df = pd.DataFrame(results)
+    summary_path = os.path.join(outdir, "entropy_summary.tsv")
+    df.to_csv(summary_path, sep="\t", index=False, float_format="%.4f")
+    print(f"  saved {summary_path}")
+
+    fig, ax = plt.subplots(figsize=(max(6, len(df) * 0.8), 4.2))
+
+    styles = [_get_method_style(l) for l in df["segmentation"]]
+    display_names = [s[0] for s in styles]
+    colors = [s[1] for s in styles]
+    
+    sns.barplot(data=df, x="segmentation", y="total_entropy", ax=ax,
+                palette={l: c for l, c in zip(df["segmentation"], colors)},
+                hue="segmentation", dodge=False,
+                **BAR_STYLE)
+    
+    ax.set_xticks(range(len(df)))
+    ax.set_xticklabels(display_names, rotation=45, ha="right", fontsize=TICK_FONTSIZE)
+    ax.tick_params(axis="y", labelsize=TICK_FONTSIZE)
+    ax.set_ylabel("Total transition matrix entropy (bits)", fontsize=AXIS_FONTSIZE)
+    ax.set_title("Transition matrix entropy comparison", **TITLE_STYLE)
+    ax.grid(axis="y", alpha=0.3)
+    
+    yrange = ax.get_ylim()[1] - ax.get_ylim()[0]
+    for i, v in enumerate(df["total_entropy"]):
+        ax.text(i, v + yrange * 0.01, f"{v:.3f}", ha="center", va="bottom", fontsize=LABEL_FONTSIZE)
+    
+    save_fig(fig, os.path.join(outdir, "entropy_summary.pdf"))
+
+
+def bin_confusion(segs1, segs2, bin_size):
+    """Bin-level confusion of two segmentations over the bins both cover.
+
+    Returns (states, conf): conf[a, b] counts bins in state states[a] in segs1
+    and states[b] in segs2; states are the union of both, naturally sorted.
+    """
+    states = sorted({row[3] for row in segs1} | {row[3] for row in segs2},
+                    key=_natural_sort_key)
+    idx = {s: i for i, s in enumerate(states)}
+    k = len(states)
+    codes1 = segments_to_codes(segs1, bin_size, idx.__getitem__)
+    codes2 = segments_to_codes(segs2, bin_size, idx.__getitem__)
+    conf = np.zeros(k * k, dtype=np.int64)
+    for chrom in codes1.keys() & codes2.keys():
+        n = min(len(codes1[chrom]), len(codes2[chrom]))
+        a, b = codes1[chrom][:n], codes2[chrom][:n]
+        both = (a >= 0) & (b >= 0)
+        conf += np.bincount(a[both] * k + b[both], minlength=k * k)
+    return states, conf.reshape(k, k)
+
+
+def confusion_metrics(states, conf):
+    """Kappa and Jaccard from a bin-level confusion matrix.
+
+    Returns {kappa, po, pe, n_bins, jaccard, per_state_kappa, per_state_jaccard};
+    the per-state dicts cover the states present in either segmentation, and
+    jaccard is their mean (one-vs-rest kappa, Jaccard of the two state masks).
+    """
+    n = int(conf.sum())
+    if n == 0:
+        return dict(kappa=0.0, po=0.0, pe=0.0, n_bins=0, jaccard=float("nan"),
+                    per_state_kappa={}, per_state_jaccard={})
+    diag = np.diag(conf)
+    rows, cols = conf.sum(axis=1), conf.sum(axis=0)
+    po = diag.sum() / n
+    pe = np.dot(rows / n, cols / n)
+    kappa = (po - pe) / (1 - pe) if pe < 1.0 else 1.0
+
+    present = (rows + cols) > 0
+    union = (rows + cols - diag)[present]
+    jac = diag[present] / union
+    pa, pb = rows[present] / n, cols[present] / n
+    po_s = 1 - (union - diag[present]) / n
+    pe_s = pa * pb + (1 - pa) * (1 - pb)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        kap = np.where(pe_s < 1.0, (po_s - pe_s) / (1 - pe_s), 1.0)
+    names = [s for s, p in zip(states, present) if p]
+    return dict(kappa=kappa, po=po, pe=pe, n_bins=n, jaccard=float(jac.mean()),
+                per_state_kappa=dict(zip(names, kap.tolist())),
+                per_state_jaccard=dict(zip(names, jac.tolist())))
+
+
+def _load_emissions_npz(path):
+    """Load a .npz emissions file → (states, matrix) or None."""
+    if not path or not os.path.exists(path):
+        return None
+    data = np.load(path, allow_pickle=False)
+    states = list(data["states"])
+    mat = data["mat"].astype(np.float64)
+    return states, mat
+
+
+def compute_composition_similarity(segs1, segs2, mapping=None):
+    """Cosine similarity of state distributions (by total bp), over every
+    state but the biggest one - see match.composition_cosine().
+    """
+    import match
+    l1 = match.state_lengths(segs1)
+    l2 = match.state_lengths(segs2)
+
+    if mapping:
+        l2_remapped = defaultdict(float)
+        for s, v in l2.items():
+            l2_remapped[mapping.get(s, s)] += v
+        l2 = dict(l2_remapped)
+    return match.composition_cosine(l1, l2)
+
+
+def _compare_pair(i, j, path_i, path_j, label_i, label_j,
+                  bin_emission_path_i, bin_emission_path_j,
+                  bw_emission_path_i, bw_emission_path_j,
+                  bin_size_i, bin_size_j, outdir):
+    """Compare one pair of segmentations (runs in a worker process)."""
+    import match
+    match_pair_overlap = match.pair_overlap
+    match_best_mapping = match.best_mapping
+    match_compare = match.compare
+    match_state_lengths = match.state_lengths
+    match_emission_cosine_mapping = match.emission_cosine_mapping
+
+    bin_size = min(bin_size_i, bin_size_j)
+
+    row = {"seg1": label_i, "seg2": label_j, "_i": i, "_j": j}
+
+    segs_full_i = _load_seg_full(path_i)
+    segs_full_j = _load_seg_full(path_j)
+
+    overlap = match_pair_overlap(segs_full_i, segs_full_j)
+    work_states = sorted({x[3] for x in segs_full_j}, key=_natural_sort_key)
+    ref_states  = sorted({x[3] for x in segs_full_i}, key=_natural_sort_key)
+    mapping = match_best_mapping(overlap, work_states, ref_states)
+
+    row["composition_similarity"] = compute_composition_similarity(segs_full_i, segs_full_j)
+
+    # One bin-level confusion matrix carries every kappa / Jaccard below.
+    states, conf = bin_confusion(segs_full_i, segs_full_j, bin_size)
+    m = confusion_metrics(states, conf)
+    row.update(kappa=m["kappa"], po=m["po"], pe=m["pe"], n_bins=m["n_bins"])
+    row["_per_state_kappa"] = m["per_state_kappa"]
+
+    pair_dir = os.path.join(outdir, "pairs", f"{label_i}_vs_{label_j}")
+    match_compare(segs_full_i, segs_full_j, overlap, mapping, pair_dir)
+
+    row["jaccard_similarity"] = m["jaccard"]
+    row["_per_state_jaccard"] = m["per_state_jaccard"]
+
+    # Overlap fraction: genome bp with identical state labels.
+    all_ref_states = {x[3] for x in segs_full_i}
+    total_same = sum(overlap.get((s, s), 0) for s in all_ref_states)
+    
+    genome_len = sum(match_state_lengths(segs_full_i).values()) or 1
+    row["overlap_fraction"] = total_same / genome_len
+
+    em_i = _load_emissions_npz(bin_emission_path_i)
+    em_j = _load_emissions_npz(bin_emission_path_j)
+    if em_i is not None and em_j is not None:
+        avg_sim, em_mapping = match_emission_cosine_mapping(em_i[0], em_i[1], em_j[0], em_j[1])
+        row["emission_similarity"] = avg_sim
+        row["emission_mapping"] = "; ".join(
+            f"{k}->{v}" for k, v in sorted(em_mapping.items()))
+
+    bw_i = _load_emissions_npz(bw_emission_path_i)
+    bw_j = _load_emissions_npz(bw_emission_path_j)
+    if bw_i is not None and bw_j is not None:
+        avg_bw_sim, _ = match_emission_cosine_mapping(bw_i[0], bw_i[1], bw_j[0], bw_j[1])
+        row["bw_emission_similarity"] = avg_bw_sim
+
+    print(f"  {label_i} vs {label_j}: "
+          f"comp_sim={row['composition_similarity']:.4f}, "
+          f"kappa={row['kappa']:.4f}, jaccard={row['jaccard_similarity']:.4f}"
+          + (f", emission={row['emission_similarity']:.4f}"
+             if "emission_similarity" in row else ""))
+    return row
+
+
+def compare_all(seg_paths, bin_sizes, outdir, analysis_dir=None, threads=None,
+                label_override=None, all_pairs=False):
+    """Selective segmentation comparison; saves metric matrices as TSV.
+
+    bin_sizes: one per segmentation; each pair uses the finer of the two for
+    kappa, so methods with different native resolutions compare fairly.
+
+    By default only pooled-vs-reference and same-method rep1-vs-rep2 pairs are
+    compared; all_pairs=True compares every pair. label_override is an optional
+    {seg_path: label} dict replacing _seg_label().
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    os.makedirs(outdir, exist_ok=True)
+    seg_outdirs = _build_seg_to_analysis_map(seg_paths, analysis_dir)
+    labels = [(label_override or {}).get(p) or _seg_label(p) for p in seg_paths]
+    n = len(seg_paths)
+
+    bin_emission_paths = {
+        i: p.replace(".bed", ".bin_emissions.npz")
+        for i, p in enumerate(seg_paths)
+        if os.path.exists(p.replace(".bed", ".bin_emissions.npz"))
+    }
+
+    bw_emission_paths = {
+        i: p.replace(".bed", ".bw_emissions.npz")
+        for i, p in enumerate(seg_paths)
+        if os.path.exists(p.replace(".bed", ".bw_emissions.npz"))
+    }
+
+    kappa_mat           = np.eye(n)
+    comp_sim_mat        = np.eye(n)
+    jaccard_mat         = np.eye(n)
+    overlap_mat         = np.eye(n)
+    em_sim_mat          = np.eye(n)
+    bw_sim_mat          = np.eye(n)
+
+    pair_order = [
+        (i, j)
+        for i in range(n) for j in range(i + 1, n)
+        if all_pairs or _should_compare(labels[i], labels[j])
+    ]
+    pair_desc = "all pairs" if all_pairs else "vs ref + same-method rep1/rep2"
+    n_workers = min(len(pair_order), threads or os.cpu_count() or 4)
+    if len(pair_order) > 0:
+        print(f"  Comparing {len(pair_order)} pairs ({pair_desc}) "
+              f"with {n_workers} processes ...", file=sys.stderr)
+
+    comparison_rows = []
+
+    if len(pair_order) > 0:
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = {
+                executor.submit(_compare_pair, i, j,
+                                seg_paths[i], seg_paths[j], labels[i], labels[j],
+                                bin_emission_paths.get(i), bin_emission_paths.get(j),
+                                bw_emission_paths.get(i), bw_emission_paths.get(j),
+                                bin_sizes[i], bin_sizes[j], outdir): (i, j)
+                for i, j in pair_order
+            }
+            for fut in as_completed(futures):
+                row = fut.result()
+                i, j = row.pop("_i"), row.pop("_j")
+                comp_sim_mat[i, j] = comp_sim_mat[j, i] = row["composition_similarity"]
+                kappa_mat[i, j] = kappa_mat[j, i] = row["kappa"]
+                jaccard_mat[i, j] = jaccard_mat[j, i] = row["jaccard_similarity"]
+                overlap_mat[i, j] = overlap_mat[j, i] = row["overlap_fraction"]
+                if "emission_similarity" in row:
+                    em_sim_mat[i, j] = em_sim_mat[j, i] = row["emission_similarity"]
+                if "bw_emission_similarity" in row:
+                    bw_sim_mat[i, j] = bw_sim_mat[j, i] = row["bw_emission_similarity"]
+                comparison_rows.append(row)
+    else:
+        print(f"  No pairs to compare ({pair_desc}).", file=sys.stderr)
+
+    ps_rows = []
+    for row in comparison_rows:
+        pk = row.pop("_per_state_kappa", None) or {}
+        pj = row.pop("_per_state_jaccard", None) or {}
+        states = sorted(set(pk.keys()) | set(pj.keys()), key=_natural_sort_key)
+        for state in states:
+            ps_rows.append({"seg1": row["seg1"], "seg2": row["seg2"], "state": state,
+                            KAPPA: pk.get(state),
+                            JACCARD: pj.get(state)})
+
+    if ps_rows:
+        ps_df = pd.DataFrame(ps_rows)
+        ps_df.to_csv(os.path.join(outdir, "per_state_metrics.tsv"),
+                     sep="\t", index=False, float_format="%.4f")
+        ref_label = labels[0]
+        for metric, label in [(KAPPA, f"Cohen's {KAPPA_DISPLAY}"),
+                              (JACCARD, JACCARD_DISPLAY)]:
+            wide_a = ps_df[ps_df["seg1"] == ref_label].pivot_table(
+                index="state", columns="seg2", values=metric, aggfunc="mean")
+            wide_b = ps_df[ps_df["seg2"] == ref_label].pivot_table(
+                index="state", columns="seg1", values=metric, aggfunc="mean")
+            wide = wide_a.combine_first(wide_b) if not wide_b.empty else wide_a
+            if not wide.empty:
+                wide = wide.reindex(sorted(wide.index, key=_natural_sort_key))
+                wide.to_csv(os.path.join(outdir, f"per_state_{metric}_vs_{ref_label}.tsv"),
+                            sep="\t", float_format="%.4f")
+                vmax = max(float(np.nanmax(np.abs(wide.values))), 0.1) if not wide.isna().all().all() else 0.1
+                fig, ax = plt.subplots(figsize=(max(6, wide.shape[1] * 0.8),
+                                                max(4, wide.shape[0] * 0.35)))
+                is_kappa = metric == KAPPA
+                sns.heatmap(wide, cmap="RdYlGn" if is_kappa else "YlGnBu",
+                            vmin=-vmax if is_kappa else 0, vmax=vmax,
+                            center=0 if is_kappa else None,
+                            linewidths=0.5, annot=True, fmt=".2f",
+                            annot_kws={"fontsize": ANNOTATION_FONTSIZE},
+                            cbar_kws={"label": f"Per-state {label}"},
+                            ax=ax, mask=wide.isna().values)
+                ax.set_title(f"Per-state {label} vs {ref_label}", **TITLE_STYLE)
+                ax.tick_params(axis="x", rotation=45, labelsize=TICK_FONTSIZE)
+                for label in ax.get_xticklabels():
+                    label.set_ha("right")
+                ax.tick_params(axis="y", rotation=0, labelsize=TICK_FONTSIZE)
+                save_fig(fig, os.path.join(outdir, f"per_state_{metric}_vs_{ref_label}.pdf"),
+                         bbox_inches=None)
+
+    pd.DataFrame(comparison_rows).to_csv(
+        os.path.join(outdir, "comparison_all_pairs.tsv"),
+        sep="\t", index=False, float_format="%.4f")
+
+    def _save_matrix(mat, name):
+        df = pd.DataFrame(mat, index=labels, columns=labels)
+        df.to_csv(os.path.join(outdir, f"{name}_matrix.tsv"),
+                  sep="\t", float_format="%.4f")
+        print(f"  saved {outdir}/{name}_matrix.tsv")
+        return df
+
+    kappa_df   = _save_matrix(kappa_mat, KAPPA)
+    _save_matrix(comp_sim_mat, "composition_similarity")
+    jaccard_df = _save_matrix(jaccard_mat, f"{JACCARD}_similarity")
+    _save_matrix(overlap_mat, "overlap")
+    em_df = _save_matrix(em_sim_mat, "emission_similarity")
+    _save_matrix(bw_sim_mat, "bw_emission_similarity")
+
+    # Per-seg comparison rows, written into each analysis dir.
+    for i, p in enumerate(seg_paths):
+        seg_dir = seg_outdirs.get(p)
+        if not seg_dir:
+            continue
+        comp_dir = os.path.join(seg_dir, "comparison")
+        os.makedirs(comp_dir, exist_ok=True)
+        kappa_df.iloc[[i]].to_csv(os.path.join(comp_dir, "kappa_vs_all.tsv"),
+                                   sep="\t", float_format="%.4f")
+        jaccard_df.iloc[[i]].to_csv(os.path.join(comp_dir, "jaccard_vs_all.tsv"),
+                                     sep="\t", float_format="%.4f")
+        if em_df is not None and i in bin_emission_paths:
+            em_df.iloc[[i]].dropna(axis=1).to_csv(
+                os.path.join(comp_dir, "emission_similarity_vs_all.tsv"),
+                sep="\t", float_format="%.4f")
+
+
+def compute_segment_stats(segs):
+    """Segment length statistics."""
+    if not segs:
+        return {}
+    lengths = np.array([row[2] - row[1] for row in segs])
+    return {
+        "n_states":      len({row[3] for row in segs}),
+        "n_segments":    len(lengths),
+        "min_length":    int(np.min(lengths)),
+        "max_length":    int(np.max(lengths)),
+        "mean_length":   float(np.mean(lengths)),
+        "median_length": float(np.median(lengths)),
+    }
+
+
+def _plot_segment_stats(df, outdir):
+    """Bar charts for each segment stats metric."""
+    x = np.arange(len(df))
+    xlabels = df["segmentation"]
+    for col, title, ylabel in [
+        ("n_states",      "Total number of states",   "Count"),
+        ("n_segments",    "Total number of segments", "Count"),
+        ("min_length",    "Min segment length",       "bp"),
+        ("max_length",    "Max segment length",       "bp"),
+        ("mean_length",   "Mean segment length",      "bp"),
+        ("median_length", "Median segment length",    "bp"),
+    ]:
+        if col not in df.columns:
+            continue
+        fig, ax = plt.subplots(figsize=(max(5, len(df) * 0.8), 3.5))
+        vals = df[col].values
+        ax.bar(x, vals, color="#4878CF", edgecolor="white", linewidth=0.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels(xlabels, rotation=55, ha="right", fontsize=TICK_FONTSIZE)
+        ax.tick_params(axis="y", labelsize=TICK_FONTSIZE)
+        ax.set_title(title, **TITLE_STYLE)
+        ax.set_ylabel(ylabel, fontsize=AXIS_FONTSIZE)
+        ax.grid(axis="y", alpha=0.3)
+        for i, v in enumerate(vals):
+            fmt = f"{v:.0f}" if v == int(v) else f"{v:.1f}"
+            ax.text(i, v + (ax.get_ylim()[1] - ax.get_ylim()[0]) * 0.01,
+                    fmt, ha="center", va="bottom", fontsize=LABEL_FONTSIZE)
+        save_fig(fig, os.path.join(outdir, f"{col}.pdf"), bbox_inches=None)
+
+
+def run_segment_stats(seg_paths, outdir, analysis_dir=None):
+    """Segment length statistics per segmentation (segment_stats.tsv), with
+    its plots.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    seg_outdirs = _build_seg_to_analysis_map(seg_paths, analysis_dir)
+    col_order = ["segmentation", "n_states", "n_segments",
+                 "min_length", "max_length", "mean_length", "median_length"]
+
+    results = []
+    for seg_path in seg_paths:
+        segs = load_bed(seg_path)
+        if not segs:
+            print(f"  WARNING: empty segmentation {seg_path}", file=sys.stderr)
+            continue
+        label = _seg_label(seg_path)
+        seg_dir = seg_outdirs.get(seg_path)
+
+        stats = compute_segment_stats(segs)
+        stats["segmentation"] = label
+        results.append(stats)
+        print(f"  {label}: {stats['n_states']} states, {stats['n_segments']} segments, "
+              f"lengths [{stats['min_length']}, {stats['max_length']}], "
+              f"mean={stats['mean_length']:.0f}, median={stats['median_length']:.0f}")
+
+        if seg_dir:
+            stats_dir = os.path.join(seg_dir, "segment_stats")
+            os.makedirs(stats_dir, exist_ok=True)
+            pd.DataFrame([stats]).to_csv(
+                os.path.join(stats_dir, "segment_stats.tsv"),
+                sep="\t", index=False, float_format="%.1f")
+
+    if results:
+        df = pd.DataFrame(results)[col_order]
+        summary_path = os.path.join(outdir, "segment_stats.tsv")
+        df.to_csv(summary_path, sep="\t", index=False, float_format="%.1f")
+        print(f"  saved {summary_path}")
+        _plot_segment_stats(df, outdir)
+
+
+def run_compare(seg, bins=None, outdir=".", analysis_dir=None, threads=None,
+                labels=None, all_pairs=False):
+    """Cross-segmentation comparison: entropy, kappa, Jaccard, segment stats.
+
+    *bins* may be a single int (broadcast to all segs), a list (one per seg),
+    or None (derived automatically from seg paths via utils.seg_bin_size).
+    Called from analysis.ipynb.
+    """
+    if bins is None:
+        from utils import seg_bin_size
+        bins = [seg_bin_size(s) for s in seg]
+    elif isinstance(bins, int):
+        bins = [bins]
+    args = SimpleNamespace(seg=seg, bins=bins, outdir=outdir,
+                           analysis_dir=analysis_dir, threads=threads,
+                           labels=labels, all_pairs=all_pairs)
+
+    bin_sizes = (args.bins * len(args.seg) if len(args.bins) == 1
+                 else args.bins)
+    if len(bin_sizes) != len(args.seg):
+        raise ValueError(f"bins must have 1 value or one per seg file "
+                         f"({len(args.seg)} files, {len(args.bins)} bin sizes given)")
+    if args.labels and len(args.labels) != len(args.seg):
+        raise ValueError(f"labels must have one value per seg file "
+                         f"({len(args.seg)} files, {len(args.labels)} labels given)")
+
+    label_override = dict(zip(args.seg, args.labels)) if args.labels else None
+    analysis_dir   = args.analysis_dir or args.outdir
+    comparison_dir = args.outdir
+
+    _save_entropy_summary(_compute_entropy(args.seg, bin_sizes), comparison_dir)
+
+    run_segment_stats(args.seg, comparison_dir, analysis_dir)
+    compare_all(args.seg, bin_sizes, comparison_dir, analysis_dir, args.threads,
+                label_override=label_override, all_pairs=args.all_pairs)

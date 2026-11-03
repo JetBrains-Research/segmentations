@@ -1,0 +1,275 @@
+workdir: "~/data/2026_segmentations/encode"
+
+tools:
+  chromhmm_jar: "ChromHMM/ChromHMM.jar"
+  omnipeak_jar: "omnipeak.jar"
+  homer_dir: "homer"
+  chromsizes: "ChromHMM/CHROMSIZES/hg38.txt"
+  coords_dir: "ChromHMM/COORDS/hg38"
+  java_opts: "-mx4000M"
+  gencode_gtf: "gencode.v46.basic.annotation.gtf.gz"
+  gene_info: "Homo_sapiens.gene_info.gz"
+
+params:
+  chromhmm_bin: 200
+  peaks_bin: 100
+  n_states: 15
+  genome: "hg38"
+  replicates: true        # process per-replicate folders (rep1/rep2) for datasets that have them
+  replicates_only: false  # process replicates only if available, without pooling
+  chromhmm: false         # run ChromHMM-based binarization and segmentation
+  homer: false            # run HOMER-based binarization and segmentation
+  macs2: false            # run MACS2-based binarization and segmentation
+  omnipeak: false         # run OmniPeak-based binarization and segmentation
+  bw_emissions: true      # process bigwig emissions or not
+  bin_emissions: true     # process binarized emissions or not
+  work_em_type: bin       # preferred work emission type for matching
+  ref_em_type: bw         # preferred reference emission type for matching
+  # Functional ROC sweep on chr1 (rules/functional.smk, functional.ipynb): the
+  # thresholds swept for the peak callers (OmniPeak --fdr, MACS2 -q, HOMER -fdr)
+  # and for ChromHMM BinarizeBam -p. Each holds the caller defaults (0.05, 0.001, 1e-4).
+  functional_sweep:
+    thresholds: [1.0e-10, 1.0e-8, 1.0e-6, 1.0e-4, 0.001, 0.01, 0.05, 0.1, 0.2, 0.5]
+    chromhmm_pvalues: [1.0e-10, 1.0e-8, 1.0e-6, 1.0e-5, 1.0e-4, 0.001, 0.01, 0.05]
+
+# Datasets excluded from every analysis; they are still processed by the
+# pipeline. Every notebook reads this list.
+#  - uterus, thyroid_gland: broad marks not usable (uterus H3K36me3 is called
+#    with 19 peaks), see the H3K27me3/H3K36me3/H3K9me3 tracks in outliers.yaml.
+#  - neurosphere: its RNA-seq top 12,000 genes are half non-coding, so its
+#    expressed TSS and gene body annotations are not comparable to the rest.
+outliers:
+  - uterus
+  - thyroid_gland
+  - neurosphere
+
+datasets:
+
+  imr90:
+    cell: "IMR90"
+    ref_chromhmm: "ENCFF714POQ"   # ChromHMM 15-state reference BED.gz
+    rnaseq: "ENCFF014JRQ"         # RNA-seq TSV
+    atac: "ENCFF243NTP"           # ATAC-seq peaks BED.gz
+    replicates: true
+    bams:
+      ENCFF021CLP: {mark: H3K4me3,  rep: rep1, control: ENCFF528QYK}
+      ENCFF355WLE: {mark: H3K4me3,  rep: rep2, control: ENCFF686YSU}
+      ENCFF064XTS: {mark: H3K27ac,  rep: rep1, control: ENCFF686YSU}
+      ENCFF827KCG: {mark: H3K27ac,  rep: rep2, control: ENCFF821GNU}
+      ENCFF812CWF: {mark: H3K4me1,  rep: rep1, control: ENCFF528QYK}
+      ENCFF927WHP: {mark: H3K4me1,  rep: rep2, control: ENCFF686YSU}
+      ENCFF197BAZ: {mark: H3K36me3, rep: rep1, control: ENCFF686YSU}
+      ENCFF994SJM: {mark: H3K36me3, rep: rep2, control: ENCFF821GNU}
+      ENCFF084CZB: {mark: H3K27me3, rep: rep1, control: ENCFF528QYK}
+      ENCFF547BFL: {mark: H3K27me3, rep: rep2, control: ENCFF686YSU}
+      ENCFF078EHX: {mark: H3K9me3,  rep: rep1, control: ENCFF528QYK}
+      ENCFF942QOQ: {mark: H3K9me3,  rep: rep2, control: ENCFF686YSU}
+
+  monocytes:
+    cell: "Monocyte"
+    ref_chromhmm: "ENCFF227EMB"
+    rnaseq: "ENCFF408GAO"
+    atac: null
+    replicates: true
+    bams:
+      ENCFF144PKE: {mark: H3K4me3, rep: rep1, control: ENCFF421DXL}
+      ENCFF640GCK: {mark: H3K4me3, rep: rep2, control: ENCFF662FMZ}
+      ENCFF872QFO: {mark: H3K27ac, rep: rep1, control: ENCFF421DXL}
+      ENCFF014BCD: {mark: H3K27ac, rep: rep2, control: ENCFF662FMZ}
+      ENCFF141KHX: {mark: H3K4me1, rep: rep1, control: ENCFF421DXL}
+      ENCFF573MNS: {mark: H3K4me1, rep: rep2, control: ENCFF662FMZ}
+      ENCFF150SGV: {mark: H3K36me3, rep: rep1, control: ENCFF421DXL}
+      ENCFF629ODR: {mark: H3K36me3, rep: rep2, control: ENCFF662FMZ}
+      ENCFF225KQA: {mark: H3K27me3, control: ENCFF134CHO} # Rep1 only
+      ENCFF168UCU: {mark: H3K9me3, rep: rep1, control: ENCFF421DXL}
+      ENCFF537BKE: {mark: H3K9me3, rep: rep2, control: ENCFF662FMZ}
+
+  monocytes_mint:
+    cell: "MonocyteMint"
+    ref_chromhmm: "ENCFF166IHY" # non-standard states naming
+    rnaseq: null
+    atac: null
+    replicates: false
+    bams:
+      ENCFF600ZLL: {mark: H3K4me3, control: ENCFF041EUP}
+      ENCFF438HLV: {mark: H3K27ac, control: ENCFF041EUP}
+      ENCFF668OLF: {mark: H3K4me1, control: ENCFF041EUP}
+      ENCFF128UWF: {mark: H3K36me3, control: ENCFF041EUP}
+      ENCFF507NNO: {mark: H3K27me3, control: ENCFF041EUP}
+      ENCFF613TME: {mark: H3K9me3, control: ENCFF041EUP}
+
+  gm12878_mint:
+    cell: "GM12878Mint"
+    ref_chromhmm: "ENCFF870JAH" # non-standard states naming
+    rnaseq: null
+    atac: null
+    replicates: false
+    bams:
+      ENCFF641VOI: {mark: H3K4me3, control: ENCFF369DNR}
+      ENCFF241BPW: {mark: H3K27ac, control: ENCFF369DNR}
+      ENCFF934GLQ: {mark: H3K4me1, control: ENCFF369DNR}
+      ENCFF869PBS: {mark: H3K36me3, control: ENCFF369DNR}
+      ENCFF304ZNG: {mark: H3K9me3, control: ENCFF369DNR}
+      ENCFF545WJH: {mark: H3K27me3, control: ENCFF369DNR}
+
+  spleen:
+    cell: "Spleen"
+    ref_chromhmm: "ENCFF183AWD"
+    rnaseq: "ENCFF143INW"         # total RNA-seq, gene quant TSV (ENCSR096LTX, female adult 61y)
+    atac: "ENCFF105FRE"           # ATAC-seq IDR peaks (ENCSR078EBD, female adult 51y)
+    replicates: true
+    bams:
+      ENCFF838OPW: {mark: H3K4me3, rep: rep1, control: ENCFF921FHW}
+      ENCFF464ZDR: {mark: H3K4me3, rep: rep2, control: ENCFF125VUN}
+      ENCFF185DQS: {mark: H3K27ac, rep: rep1, control: ENCFF921FHW}
+      ENCFF472TSV: {mark: H3K27ac, rep: rep2, control: ENCFF125VUN}
+      ENCFF915NOI: {mark: H3K4me1, rep: rep1, control: ENCFF921FHW}
+      ENCFF702ICJ: {mark: H3K4me1, rep: rep2, control: ENCFF125VUN}
+      ENCFF877UDA: {mark: H3K36me3, rep: rep1, control: ENCFF921FHW}
+      ENCFF934RMM: {mark: H3K36me3, rep: rep2, control: ENCFF125VUN}
+      ENCFF865ORP: {mark: H3K9me3, rep: rep1, control: ENCFF921FHW}
+      ENCFF425JOG: {mark: H3K9me3, rep: rep2, control: ENCFF125VUN}
+      ENCFF811PTP: {mark: H3K27me3, rep: rep1, control: ENCFF921FHW}
+      ENCFF488FJX: {mark: H3K27me3, rep: rep2, control: ENCFF125VUN}
+
+  heart_right_ventricle:
+    cell: "HeartRightVentricle"
+    ref_chromhmm: "ENCFF393FJX"
+    rnaseq: "ENCFF717ZEJ"         # total RNA-seq, gene quant TSV (ENCSR828JSJ, donor ENCDO477WED — exact match)
+    atac: "ENCFF898WYV"           # ATAC-seq IDR peaks (ENCSR133CMC, donor ENCDO477WED — exact match)
+    replicates: false
+    bams:
+      ENCFF613ARJ: {mark: H3K4me3, control: ENCFF542SOW}
+      ENCFF337BMH: {mark: H3K27ac, control: ENCFF542SOW}
+      ENCFF857EPZ: {mark: H3K4me1, control: ENCFF542SOW}
+      ENCFF667SEX: {mark: H3K36me3, control: ENCFF542SOW}
+      ENCFF126JDQ: {mark: H3K9me3, control: ENCFF542SOW}
+      ENCFF534HLX: {mark: H3K27me3, control: ENCFF542SOW}
+
+  neurosphere:
+    cell: "Neurosphere"
+    ref_chromhmm: "ENCFF996IOZ"
+    rnaseq: "ENCFF241GEU"         # total RNA-seq, gene quant TSV (ENCSR043KVA, donor ENCDO594MAO — exact match)
+    atac: null                    # no neurosphere ATAC-seq in ENCODE
+    replicates: false
+    bams:
+      ENCFF345SEO: {mark: H3K4me3, control: ENCFF014GVK}
+      ENCFF888LGJ: {mark: H3K27ac, control: ENCFF014GVK}
+      ENCFF451LXC: {mark: H3K4me1, control: ENCFF014GVK}   # redacted alignments (15-week embryo donor)
+      ENCFF141LZS: {mark: H3K36me3, control: ENCFF014GVK}
+      ENCFF124GYP: {mark: H3K9me3, control: ENCFF014GVK}
+      ENCFF540GNQ: {mark: H3K27me3, control: ENCFF014GVK}
+
+  sigmoid_colon:
+    cell: "SigmoidColon"
+    ref_chromhmm: "ENCFF130HAO"
+    rnaseq: "ENCFF045PTB"         # total RNA-seq, gene quant TSV (ENCSR812AKX, donor ENCDO451RUA — exact match)
+    atac: "ENCFF460SWB"           # ATAC-seq IDR peaks (ENCSR086OGH, donor ENCDO451RUA — exact match)
+    replicates: false
+    bams:
+      ENCFF113NNR: {mark: H3K4me3, control: ENCFF076ONX}
+      ENCFF633SJK: {mark: H3K27ac, control: ENCFF076ONX}
+      ENCFF053HVD: {mark: H3K4me1, control: ENCFF076ONX}
+      ENCFF299QLA: {mark: H3K36me3, control: ENCFF076ONX}
+      ENCFF662QPM: {mark: H3K9me3, control: ENCFF076ONX}
+      ENCFF149XIX: {mark: H3K27me3, control: ENCFF076ONX}
+
+  adrenal_gland:
+    cell: "AdrenalGland"
+    ref_chromhmm: "ENCFF950TVI"
+    rnaseq: "ENCFF491ISO"         # total RNA-seq, gene quant TSV (ENCSR276MMH, donor ENCDO845WKR — different donor than ChIP-seq ENCDO058AAA)
+    atac: "ENCFF511DPE"           # ATAC-seq IDR peaks (ENCSR548KIL, donor ENCDO845WKR — same donor as RNA-seq)
+    replicates: false
+    bams:
+      ENCFF792QXD: {mark: H3K4me3, control: ENCFF874DMD}
+      ENCFF330SJO: {mark: H3K27ac, control: ENCFF874DMD}
+      ENCFF636MLS: {mark: H3K4me1, control: ENCFF874DMD}
+      ENCFF874WZT: {mark: H3K36me3, control: ENCFF874DMD}
+      ENCFF875QEV: {mark: H3K9me3, control: ENCFF874DMD}
+      ENCFF934KYU: {mark: H3K27me3, control: ENCFF874DMD}
+
+  thyroid_gland:
+    cell: "ThyroidGland"
+    ref_chromhmm: "ENCFF370FZP"
+    rnaseq: "ENCFF632UQN"         # total RNA-seq, gene quant TSV (ENCSR687HJY, female adult 51y)
+    atac: "ENCFF365RAW"           # ATAC-seq IDR peaks (ENCSR474XFV, male adult 54y)
+    replicates: false
+    bams:
+      ENCFF993OFD: {mark: H3K4me3, control: ENCFF044TOH}
+      ENCFF408NBC: {mark: H3K27ac, control: ENCFF044TOH}
+      ENCFF401CCX: {mark: H3K4me1, control: ENCFF044TOH}
+      ENCFF166JAN: {mark: H3K36me3, control: ENCFF044TOH}
+      ENCFF910RQR: {mark: H3K9me3, control: ENCFF044TOH}
+      ENCFF451FTP: {mark: H3K27me3, control: ENCFF044TOH}
+
+  uterus:
+    cell: "Uterus"
+    ref_chromhmm: "ENCFF781KNB"
+    rnaseq: "ENCFF467LKW"         # total RNA-seq, gene quant TSV (ENCSR676SRP, female adult 59y)
+    atac: "ENCFF914OPC"           # ATAC-seq IDR peaks (ENCSR775SYU, female adult 59y)
+    replicates: false
+    bams:
+      ENCFF781UFS: {mark: H3K4me3, control: ENCFF074QAU}
+      ENCFF980GJI: {mark: H3K4me3, control: ENCFF394KMS}
+      ENCFF568VJD: {mark: H3K27ac, control: ENCFF394KMS}
+      ENCFF175TLF: {mark: H3K4me1, control: ENCFF394KMS}
+      ENCFF693PGT: {mark: H3K36me3, control: ENCFF394KMS}
+      ENCFF520GBN: {mark: H3K9me3, control: ENCFF394KMS}
+      ENCFF334GYE: {mark: H3K27me3, control: ENCFF394KMS}
+
+  tibial_nerve:
+    cell: "TibialNerve"
+    ref_chromhmm: "ENCFF771QDN"
+    rnaseq: "ENCFF398VOV"         # total RNA-seq, gene quant TSV (ENCSR272UNO, female adult 51y)
+    atac: "ENCFF623GOH"           # ATAC-seq IDR peaks (ENCSR831KAH, female adult 51y) — ⚠ low FRiP audit warning
+    replicates: false
+    bams:
+      ENCFF089YNU: {mark: H3K4me3, control: ENCFF496QBK}
+      ENCFF233QEC: {mark: H3K27ac, control: ENCFF496QBK}
+      ENCFF513KEZ: {mark: H3K4me1, control: ENCFF496QBK}
+      ENCFF658UFR: {mark: H3K36me3, control: ENCFF496QBK}
+      ENCFF525VJO: {mark: H3K9me3, control: ENCFF496QBK}
+      ENCFF785JGT: {mark: H3K27me3, control: ENCFF496QBK}
+
+  heart_left_ventricle:
+    cell: "HeartLeftVentricle"
+    ref_chromhmm: "ENCFF490FOH"
+    rnaseq: "ENCFF269SPH"         # total RNA-seq, gene quant TSV (ENCSR570DQR, donor ENCDO967KID — exact match)
+    atac: "ENCFF568NPG"           # ATAC-seq pseudoreplicated peaks (ENCSR310RJN, donor ENCDO967KID — exact match; single-rep, no IDR)
+    replicates: false
+    bams:
+      ENCFF080RUF: {mark: H3K4me3, control: ENCFF013ION}
+      ENCFF065CTN: {mark: H3K27ac, control: ENCFF013ION}
+      ENCFF451FGF: {mark: H3K4me1, control: ENCFF013ION}
+      ENCFF526UZK: {mark: H3K36me3, control: ENCFF013ION}
+      ENCFF255BHA: {mark: H3K9me3, control: ENCFF013ION}
+      ENCFF482IDO: {mark: H3K27me3, control: ENCFF013ION}
+
+  substantia_nigra:
+    cell: "SubstantiaNigra"
+    ref_chromhmm: "ENCFF675GXD"
+    rnaseq: null                  # no RNA-seq for substantia nigra in ENCODE (GRCh38)
+    atac: null                    # no ATAC-seq for substantia nigra in ENCODE (GRCh38)
+    replicates: false
+    bams:
+      ENCFF009SQK: {mark: H3K4me3, control: ENCFF459CBV}
+      ENCFF750MOL: {mark: H3K27ac, control: ENCFF459CBV}   # rep1
+#      ENCFF608CJW: {mark: H3K27ac, control: ENCFF459CBV}   # rep2
+      ENCFF232AJZ: {mark: H3K4me1, control: ENCFF459CBV}   # ENCODE3; original ENCFF326YFL was revoked
+      ENCFF723KKW: {mark: H3K36me3, control: ENCFF459CBV}
+      ENCFF234BHH: {mark: H3K9me3, control: ENCFF459CBV}
+      ENCFF277JBP: {mark: H3K27me3, control: ENCFF459CBV}
+
+  temporal_lobe:
+    cell: "TemporalLobe"
+    ref_chromhmm: "ENCFF538HOC"
+    rnaseq: "ENCFF823QHI"         # total RNA-seq, gene quant TSV (ENCSR000AFJ) — ⚠ fetal 24wk; no adult temporal lobe RNA-seq in ENCODE
+    atac: null                    # no ATAC-seq for temporal lobe in ENCODE (GRCh38)
+    replicates: false
+    bams:
+      ENCFF442BZF: {mark: H3K4me3, control: ENCFF611NSO}
+      ENCFF259YFQ: {mark: H3K27ac, control: ENCFF611NSO}
+      ENCFF967XVG: {mark: H3K4me1, control: ENCFF611NSO}   # redacted alignments (Roadmap Epigenomics)
+      ENCFF123LMF: {mark: H3K36me3, control: ENCFF611NSO}
+      ENCFF579GDZ: {mark: H3K9me3, control: ENCFF611NSO}
+      ENCFF527KGU: {mark: H3K27me3, control: ENCFF611NSO}
