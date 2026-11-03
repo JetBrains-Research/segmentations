@@ -319,6 +319,14 @@ def test_summary_ranking_and_benchmarks(tmp_path, monkeypatch):
     assert np.isclose(benchmarks_indiv.loc["chromhmm_default", "Score"], 0.80)
     assert np.isclose(benchmarks_indiv.loc["kmeans_omni", "Score"], 2.15 / 3.0)
 
+    # 3) Uniform weights based summary ranking
+    ranking_indiv_uni = env["summary_ranking"](df_evidence, [env["REFERENCE"], "chromhmm_default", "kmeans_omni"], table_scores, axis_weights={})
+    assert env["REFERENCE"] not in ranking_indiv_uni.index
+    # chromhmm_default: (1.0 * 1 + 0.0 * 1) / 2 = 0.5
+    # kmeans_omni: (0.0 * 1 + 1.0 * 1) / 2 = 0.5
+    assert np.isclose(ranking_indiv_uni.loc["chromhmm_default", "Score"], 0.5)
+    assert np.isclose(ranking_indiv_uni.loc["kmeans_omni", "Score"], 0.5)
+
     # Output figures verification
     saved_titles = {}
     orig_save_fig = env["utils"].save_fig
@@ -336,6 +344,16 @@ def test_summary_ranking_and_benchmarks(tmp_path, monkeypatch):
     env["plot_ranking"](ranking_indiv, table_scores, "joint", out_rank_joint, xlabel="Summary rank score")
     assert os.path.exists(out_rank_joint)
     assert saved_titles[out_rank_joint] == "Summary ranks of the joint models"
+
+    out_rank_indiv_uni = str(tmp_path / "ranking_all_individual_uni.pdf")
+    env["plot_ranking"](ranking_indiv_uni, table_scores, "individual", out_rank_indiv_uni, xlabel="Summary rank score")
+    assert os.path.exists(out_rank_indiv_uni)
+    assert saved_titles[out_rank_indiv_uni] == "Summary ranks of the individual models"
+
+    out_rank_joint_uni = str(tmp_path / "ranking_all_joint_uni.pdf")
+    env["plot_ranking"](ranking_indiv_uni, table_scores, "joint", out_rank_joint_uni, xlabel="Summary rank score")
+    assert os.path.exists(out_rank_joint_uni)
+    assert saved_titles[out_rank_joint_uni] == "Summary ranks of the joint models"
 
 
 def test_plot_replicate_family_heatmaps(tmp_path):
