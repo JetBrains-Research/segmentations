@@ -3,6 +3,7 @@ import gzip
 import os
 import tempfile
 import pytest
+import pandas as pd
 
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "rules")))
@@ -447,3 +448,238 @@ def test_global_bin_constants_and_helpers():
     assert utils.get_bin_size("chromhmm_default") == 200
     assert utils.get_bin_size("kmeans_homer") == 100
     assert utils.get_bin_size("ds/omni/omni_kmeans_states_matched.bed") == 100
+
+
+def test_compute_consistency_curve():
+    # Synthetic counts dict for 2 states over 3 segmentations:
+    # State A: depth cumulative <= 1: 10, <= 2: 15, <= 3: 20
+    # State B: depth cumulative <= 1: 30, <= 2: 45, <= 3: 50
+    counts = {
+        "StateA": {1: 10, 2: 15, 3: 20},
+        "StateB": {1: 30, 2: 45, 3: 50},
+    }
+    # Physical genome size G = (sum_s sum_{n=1}^3 shared_s(n)) / 3
+    # StateA: (20-0) + (20-10) + (20-15) = 20 + 10 + 5 = 35
+    # StateB: (50-0) + (50-30) + (50-45) = 50 + 20 + 5 = 75
+    # Total sample bins = 35 + 75 = 110, G = 110 / 3
+    # N=1 (shared >= 1): (20 - 0) + (50 - 0) = 70 -> frac = 70 / (110/3)
+    # N=2 (shared >= 2): (20 - 10) + (50 - 30) = 10 + 20 = 30 -> frac = 30 / (110/3)
+    # N=3 (shared >= 3): (20 - 15) + (50 - 45) = 5 + 5 = 10 -> frac = 10 / (110/3)
+    assert analyze.compute_genome_size(counts) == pytest.approx(110.0 / 3.0)
+
+    curve = analyze.compute_consistency_curve(counts)
+    assert len(curve) == 3
+    assert curve[0] == (1, 70, pytest.approx(70.0 / (110.0 / 3.0)))
+    assert curve[1] == (2, 30, pytest.approx(30.0 / (110.0 / 3.0)))
+    assert curve[2] == (3, 10, pytest.approx(10.0 / (110.0 / 3.0)))
+
+    # Explicit genome_size = 70
+    curve_g70 = analyze.compute_consistency_curve(counts, genome_size=70)
+    assert curve_g70[0] == (1, 70, 1.0)
+    assert curve_g70[1] == (2, 30, pytest.approx(30.0 / 70.0))
+    assert curve_g70[2] == (3, 10, pytest.approx(10.0 / 70.0))
+
+    # Test with exclude_quiescent=True
+    counts_with_quies = {
+        "1_TssA": {1: 10, 2: 15, 3: 20},
+        "15_Quies": {1: 100, 2: 200, 3: 300},
+    }
+    # Full genome size G = (35 + (300 + 200 + 100)) / 3 = (35 + 600) / 3 = 635 / 3
+    assert analyze.compute_genome_size(counts_with_quies) == pytest.approx(635.0 / 3.0)
+    curve_no_quies = analyze.compute_consistency_curve(counts_with_quies, exclude_quiescent=True)
+    assert len(curve_no_quies) == 3
+    # Only 1_TssA bins normalized by full G:
+    # N=1: 20 / (635/3) = 60/635
+    # N=2: (20 - 10) / (635/3) = 30/635
+    # N=3: (20 - 15) / (635/3) = 15/635
+    assert curve_no_quies[0] == (1, 20, pytest.approx(60.0 / 635.0))
+    assert curve_no_quies[1] == (2, 10, pytest.approx(30.0 / 635.0))
+    assert curve_no_quies[2] == (3, 5, pytest.approx(15.0 / 635.0))
+
+    # All quiescent states excluded
+    assert analyze.compute_consistency_curve({"Quies": {1: 10, 2: 20}}, exclude_quiescent=True) == []
+
+    # Empty counts
+    assert analyze.compute_consistency_curve({}) == []
+    assert analyze.compute_genome_size({}) == 0
+
+
+def test_plot_method_consistency(tmp_path):
+    counts = {
+        "1_TssA": {1: 10, 2: 20},
+        "2_Quies": {1: 5, 2: 30},
+    }
+    outpath = str(tmp_path / "method_consistency.pdf")
+    analyze.plot_method_consistency(counts, "Test Model", outpath)
+    assert os.path.exists(outpath)
+
+    outpath_no_quies = str(tmp_path / "method_consistency_no_quies.pdf")
+    analyze.plot_method_consistency(counts, "Test Model", outpath_no_quies, exclude_quiescent=True)
+    assert os.path.exists(outpath_no_quies)
+
+
+def test_compute_stacked_consistency():
+    counts = {
+        "StateA": {1: 10, 2: 15, 3: 18, 4: 20},
+        "StateB": {1: 30, 2: 45, 3: 50, 4: 60},
+    }
+    # M = 4
+    # StateA: (20-0) + (20-10) + (20-15) + (20-18) = 20 + 10 + 5 + 2 = 37
+    # StateB: (60-0) + (60-30) + (60-45) + (60-50) = 60 + 30 + 15 + 10 = 115
+    # G = (37 + 115) / 4 = 152 / 4 = 38.0
+    # 0%: n = 1 -> StateA: 20/38, StateB: 60/38, Total = 80/38
+    # 25%: n = 1 -> StateA: 20/38, StateB: 60/38
+    # 50%: n = 2 -> StateA: (20-10)/38 = 10/38, StateB: (60-30)/38 = 30/38
+    # 75%: n = 3 -> StateA: (20-15)/38 = 5/38, StateB: (60-45)/38 = 15/38
+    # 100%: n = 4 -> StateA: (20-18)/38 = 2/38, StateB: (60-50)/38 = 10/38
+    df = analyze.compute_stacked_consistency(counts)
+    expected_indices = ["0%", "1%", "2%", "3%", "5%", "10%", "25%", "50%", "75%", "100%"]
+    assert list(df.index) == expected_indices
+    assert list(df.columns) == ["StateA", "StateB"]
+    assert df.loc["0%", "StateA"] == pytest.approx(20.0 / 38.0)
+    assert df.loc["0%", "StateB"] == pytest.approx(60.0 / 38.0)
+    assert df.loc["1%", "StateA"] == pytest.approx(20.0 / 38.0)
+    assert df.loc["10%", "StateA"] == pytest.approx(20.0 / 38.0)
+    assert df.loc["50%", "StateA"] == pytest.approx(10.0 / 38.0)
+    assert df.loc["50%", "StateB"] == pytest.approx(30.0 / 38.0)
+    assert df.loc["100%", "StateA"] == pytest.approx(2.0 / 38.0)
+    assert df.loc["100%", "StateB"] == pytest.approx(10.0 / 38.0)
+
+    # Test with custom fractions
+    custom_df = analyze.compute_stacked_consistency(counts, fractions=(0.0, 0.5, 1.0))
+    assert list(custom_df.index) == ["0%", "50%", "100%"]
+
+    # Test with explicit genome_size
+    df_g80 = analyze.compute_stacked_consistency(counts, genome_size=80)
+    assert df_g80.loc["0%", "StateA"] == pytest.approx(20.0 / 80.0)
+    assert df_g80.loc["0%", "StateB"] == pytest.approx(60.0 / 80.0)
+
+    # Test with fine-grained M=100
+    counts_100 = {
+        "StateA": {i: i * 10 for i in range(1, 101)},
+        "StateB": {i: i * 20 for i in range(1, 101)},
+    }
+    # For StateA, depths[i] = i * 10.
+    # sum_{n=1}^100 (1000 - (n-1)*10) = 100*1000 - 10 * sum_{k=0}^99 k = 100000 - 10 * (99*100/2) = 100000 - 49500 = 50500
+    # For StateB, sum = 2 * 50500 = 101000
+    # Total sample bins = 50500 + 101000 = 151500
+    # G = 151500 / 100 = 1515.0
+    df_100 = analyze.compute_stacked_consistency(counts_100)
+    assert list(df_100.index) == expected_indices
+    # 1%: n = round(0.01 * 100) = 1 -> StateA: 1000 / 1515
+    # 10%: n = round(0.10 * 100) = 10 -> StateA: (1000 - 90) / 1515 = 910 / 1515
+    assert df_100.loc["1%", "StateA"] == pytest.approx(1000.0 / 1515.0)
+    assert df_100.loc["10%", "StateA"] == pytest.approx(910.0 / 1515.0)
+
+    # Empty counts
+    assert analyze.compute_stacked_consistency({}).empty
+
+
+def test_plot_stacked_consistency(tmp_path):
+    counts = {
+        "1_TssA": {1: 10, 2: 15, 3: 20, 4: 25},
+        "2_Quies": {1: 30, 2: 45, 3: 60, 4: 75},
+    }
+    # With custom colors dict (hex and rgb string)
+    colors = {"1_TssA": "#FF0000", "2_Quies": "255,255,255"}
+    outpath = str(tmp_path / "stacked_consistency_custom.pdf")
+    analyze.plot_stacked_consistency(counts, "Test Model", outpath, colors=colors)
+    assert os.path.exists(outpath)
+
+    # With colors=None (falls back to canonical markup state colors)
+    outpath_default = str(tmp_path / "stacked_consistency_default.pdf")
+    analyze.plot_stacked_consistency(counts, "Test Model", outpath_default, colors=None)
+    assert os.path.exists(outpath_default)
+
+
+def test_method_linestyle_and_normalization():
+    assert utils.method_linestyle("chromhmm_default") == "-"
+    assert utils.method_linestyle("joint_chromhmm") == "--"
+    assert utils.method_linestyle("kmeans_homer") == "-"
+    assert utils.method_linestyle("joint_kmeans_homer") == "--"
+    assert utils.method_linestyle("De-novo Homer KMeans") == "-"
+    assert utils.method_linestyle("De-novo Joint Homer KMeans") == "--"
+    assert utils.method_linestyle("15-state Default ChromHMM") == "-"
+    assert utils.method_linestyle("15-state Joint ChromHMM") == "--"
+
+    assert utils.normalize_method("15state_chromhmm_default") == "chromhmm_default"
+    assert utils.normalize_method("15state_joint_chromhmm") == "joint_chromhmm"
+    assert utils.normalize_method("denovo_kmeans_homer") == "kmeans_homer"
+    assert utils.normalize_method("denovo_joint_kmeans_homer") == "joint_kmeans_homer"
+    assert utils.normalize_method("denovo_kmeans_macs2") == "kmeans_macs2"
+    assert utils.normalize_method("denovo_joint_kmeans_macs2") == "joint_kmeans_macs2"
+    assert utils.normalize_method("denovo_kmeans_omni") == "kmeans_omni"
+    assert utils.normalize_method("denovo_joint_kmeans_omni") == "joint_kmeans_omni"
+
+
+def test_plot_methods_consistency(tmp_path):
+    counts_a = {
+        "1_TssA": {1: 10, 2: 20},
+        "2_Quies": {1: 5, 2: 30},
+    }
+    counts_b = {
+        "1_TssA": {1: 8, 2: 20},
+        "2_Quies": {1: 12, 2: 30},
+    }
+
+    # Test with list of tuples
+    models = [
+        ("15-state Default ChromHMM", counts_a, "chromhmm_default"),
+        ("15-state Joint ChromHMM", counts_b, "joint_chromhmm"),
+        ("De-novo Homer KMeans", counts_a, "kmeans_homer"),
+        ("De-novo Joint Homer KMeans", counts_b, "joint_kmeans_homer"),
+    ]
+    outpath_list = str(tmp_path / "consistency_methods_list.pdf")
+    analyze.plot_methods_consistency(models, "Method consistency (w=0)", outpath_list)
+    assert os.path.exists(outpath_list)
+
+    # Test with DataFrame
+    df_list = []
+    for title, counts, m_key in models:
+        curve = analyze.compute_consistency_curve(counts)
+        df_m = pd.DataFrame(curve, columns=["N", "SharedBins", "Fraction"])
+        df_m["Model"] = title
+        df_m["Slug"] = m_key
+        df_list.append(df_m)
+    df_all = pd.concat(df_list, ignore_index=True)
+
+    outpath_df = str(tmp_path / "consistency_methods_df.pdf")
+    analyze.plot_methods_consistency(df_all, "Method consistency (w=0)", outpath_df)
+    assert os.path.exists(outpath_df)
+
+    # Test with dict
+    dict_data = {
+        "Default ChromHMM": counts_a,
+        "Joint ChromHMM": counts_b,
+    }
+    outpath_dict = str(tmp_path / "consistency_methods_dict.pdf")
+    analyze.plot_methods_consistency(dict_data, "Method consistency (w=0)", outpath_dict)
+    assert os.path.exists(outpath_dict)
+
+    # Test with custom styles
+    custom_styles = {
+        "Default ChromHMM": {"color": "#FF0000", "linestyle": ":"},
+        "Joint ChromHMM": {"color": "#00FF00", "linestyle": "-."},
+    }
+    outpath_styles = str(tmp_path / "consistency_methods_styles.pdf")
+    analyze.plot_methods_consistency(dict_data, "Method consistency (w=0)", outpath_styles, styles=custom_styles)
+    assert os.path.exists(outpath_styles)
+
+    # Test with exclude_quiescent=True
+    outpath_no_quies = str(tmp_path / "consistency_methods_no_quies.pdf")
+    analyze.plot_methods_consistency(dict_data, "Method consistency (w=0)", outpath_no_quies, exclude_quiescent=True)
+    assert os.path.exists(outpath_no_quies)
+
+    # Test with yscale="log1p"
+    outpath_log1p = str(tmp_path / "consistency_methods_log1p.pdf")
+    analyze.plot_methods_consistency(df_all, "Method consistency (w=0)", outpath_log1p, yscale="log1p")
+    assert os.path.exists(outpath_log1p)
+
+    outpath_method_log1p = str(tmp_path / "method_consistency_log1p.pdf")
+    analyze.plot_method_consistency(counts_a, "Method consistency (w=0)", outpath_method_log1p, yscale="log1p")
+    assert os.path.exists(outpath_method_log1p)
+
+    # Empty inputs
+    analyze.plot_methods_consistency([], "Title", str(tmp_path / "empty.pdf"))
+    analyze.plot_methods_consistency({}, "Title", str(tmp_path / "empty.pdf"))
+    analyze.plot_methods_consistency(pd.DataFrame(), "Title", str(tmp_path / "empty.pdf"))

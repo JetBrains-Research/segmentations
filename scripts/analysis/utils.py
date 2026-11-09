@@ -280,14 +280,17 @@ _KEY_BY_DISPLAY = {label: key for key, label in DISPLAY_NAMES.items()}
 
 def normalize_method(name):
     """Normalize a method name to its canonical key, or None when unknown."""
-    name = str(name).strip().lower().replace(" ", "_").replace("omnipeak", "omni")
+    name = str(name).strip().lower().replace(" ", "_").replace("omnipeak", "omni").replace("-", "_")
+    for prefix in ("de_novo_", "denovo_", "15_state_", "15state_", "18_state_", "18state_", "epi_15_", "epi_denovo_", "epi_"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
     if name in (CHROMHMM, "default_chromhmm", CHROMHMM_DEFAULT, "ref_15", "individual"):
         return CHROMHMM_DEFAULT
     if name in (JOINT_CHROMHMM, "joint_ref_15", "joint"):
         return JOINT_CHROMHMM
-    is_joint = name.startswith("joint_")
+    is_joint = name.startswith("joint_") or "_joint" in name
     if is_joint:
-        name = name[len("joint_"):]
+        name = name.replace("joint_", "").replace("_joint", "")
     if name.startswith("kmeans_"):
         name = name[len("kmeans_"):]
     elif name.endswith("_kmeans"):
@@ -634,6 +637,11 @@ def method_color(method):
     if is_joint(method) or (state_model and is_joint(state_model)):
         return darken_color(color)
     return color
+
+
+def method_linestyle(method):
+    """Plot linestyle for a method: '--' for joint models, '-' for individual models."""
+    return "--" if is_joint(method) else "-"
 
 
 def seg_label(path):

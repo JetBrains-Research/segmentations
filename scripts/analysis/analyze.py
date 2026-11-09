@@ -617,6 +617,269 @@ def plot_state_consistency(state_depth_counts, title, out_path, colors=None):
     save_fig(fig, out_path)
 
 
+def compute_genome_size(state_depth_counts):
+    """Estimate physical genome size G (in bins) across M segmentations.
+
+    Calculates G = (1 / M) * sum_s sum_{n=1}^M (depths_s[M] - depths_s[n-1]),
+    which is the exact average total number of bins per segmentation across all states.
+    """
+    if not state_depth_counts:
+        return 0
+    M = max(max(d.keys()) for d in state_depth_counts.values())
+    if M == 0:
+        return 0
+    total_sample_bins = sum(
+        depths[M] - depths.get(n - 1, 0)
+        for depths in state_depth_counts.values()
+        for n in range(1, M + 1)
+    )
+    return total_sample_bins / M
+
+
+def compute_consistency_curve(state_depth_counts, exclude_quiescent=False, genome_size=None):
+    """Overall fraction of shared genome coverage supported by >= N segmentations.
+
+    Aggregates across all states (or excluding quiescent states) without split by states,
+    normalized by the physical genome size G:
+    For N in 1..M, fraction(N) = sum_s(depths_s[M] - depths_s[N-1]) / G.
+    """
+    if not state_depth_counts:
+        return []
+    M = max(max(d.keys()) for d in state_depth_counts.values())
+    if genome_size is not None:
+        G = genome_size
+    else:
+        G = compute_genome_size(state_depth_counts)
+    if G == 0:
+        return []
+    if exclude_quiescent:
+        state_depth_counts = {
+            s: d for s, d in state_depth_counts.items()
+            if not utils.is_quiescent(s)
+        }
+        if not state_depth_counts:
+            return []
+    curve = []
+    for n in range(1, M + 1):
+        shared = sum(depths[M] - depths.get(n - 1, 0) for depths in state_depth_counts.values())
+        curve.append((n, shared, shared / G))
+    return curve
+
+
+def plot_method_consistency(state_depth_counts, title, out_path, color=None, linestyle=None,
+                            exclude_quiescent=False, yscale="linear", genome_size=None):
+    """Plot consistency curve without split by states: fraction of shared coverage by >= N epigenomes."""
+    if not state_depth_counts:
+        return
+    curve = compute_consistency_curve(state_depth_counts, exclude_quiescent=exclude_quiescent,
+                                    genome_size=genome_size)
+    if not curve:
+        return
+    x = [n for n, _, _ in curve]
+    y = [frac for _, _, frac in curve]
+
+    if color is None:
+        norm_k = utils.normalize_method(title) or title
+        color = utils.method_color(norm_k)
+    if linestyle is None:
+        norm_k = utils.normalize_method(title) or title
+        linestyle = utils.method_linestyle(norm_k)
+
+    fig = plt.figure(figsize=(8, 5))
+    plt.plot(x, y, label=title, marker='.', markersize=2, color=color, linestyle=linestyle, alpha=0.9)
+    if yscale == "log1p":
+        plt.yscale("function", functions=(np.log1p, np.expm1))
+    elif isinstance(yscale, (tuple, list)) and len(yscale) == 2:
+        plt.yscale("function", functions=yscale)
+    elif yscale and yscale != "linear":
+        plt.yscale(yscale)
+    plt.title(f"Method consistency ({title})", **TITLE_STYLE)
+    plt.xlabel("Supported by >= N segmentations", fontsize=AXIS_FONTSIZE)
+    plt.ylabel("Fraction of shared genome coverage", fontsize=AXIS_FONTSIZE)
+    max_y = max(y) if y else 1.0
+    if yscale != "log1p":
+        plt.ylim(0, max(1.05, max_y * 1.05))
+    plt.xlim(1, max(x))
+    plt.xticks(fontsize=TICK_FONTSIZE)
+    plt.yticks(fontsize=TICK_FONTSIZE)
+    plt.grid(True, alpha=0.3)
+    save_fig(fig, out_path)
+
+
+def plot_methods_consistency(methods_data, title, out_path, styles=None, exclude_quiescent=False,
+                            yscale="linear", genome_size=None):
+    """Plot consistency curves for multiple methods on a single figure with project-wide styling.
+
+    *methods_data*:
+        - dict of {label: state_depth_counts}
+        - or list of tuples: (label, state_depth_counts, [method_key])
+        - or list of dicts: [{'title': ..., 'counts': ..., 'slug': ...}, ...]
+        - or pd.DataFrame with ['N', 'Fraction', 'Model'] columns
+    *title*: figure title
+    *out_path*: output file path
+    *styles*: optional dict mapping label or method key to dict(color=..., linestyle=...)
+    *exclude_quiescent*: whether to ignore quiescent states when computing curves from counts
+    *yscale*: y-axis scale ('linear', 'log1p', 'log', 'symlog', or tuple of functions)
+    *genome_size*: optional genome size G for normalization when computing from counts
+    """
+    if methods_data is None:
+        return
+    if isinstance(methods_data, (dict, list, tuple)) and len(methods_data) == 0:
+        return
+    if isinstance(methods_data, pd.DataFrame) and methods_data.empty:
+        return
+
+    curves = []
+    if isinstance(methods_data, pd.DataFrame):
+        for model_name, group in methods_data.groupby("Model", sort=False):
+            x = group["N"].values
+            y = group["Fraction"].values
+            slug = group["Slug"].iloc[0] if "Slug" in group.columns else None
+            curves.append((model_name, x, y, slug or model_name))
+    elif isinstance(methods_data, dict):
+        for label, counts in methods_data.items():
+            curve = compute_consistency_curve(counts, exclude_quiescent=exclude_quiescent, genome_size=genome_size) if isinstance(counts, dict) else counts
+            if curve:
+                x = [n for n, _, _ in curve]
+                y = [frac for _, _, frac in curve]
+                curves.append((label, x, y, label))
+    elif isinstance(methods_data, (list, tuple)):
+        for item in methods_data:
+            if isinstance(item, dict):
+                label = item.get("title") or item.get("label") or item.get("slug")
+                counts = item.get("counts") or item.get("consistency")
+                method_key = item.get("method") or item.get("slug") or label
+            elif isinstance(item, (list, tuple)):
+                label = item[0]
+                counts = item[1]
+                method_key = item[2] if len(item) > 2 else label
+            else:
+                continue
+            curve = compute_consistency_curve(counts, exclude_quiescent=exclude_quiescent, genome_size=genome_size) if isinstance(counts, dict) else counts
+            if curve:
+                x = [n for n, _, _ in curve]
+                y = [frac for _, _, frac in curve]
+                curves.append((label, x, y, method_key))
+
+    if not curves:
+        return
+
+    fig = plt.figure(figsize=(8, 5))
+    max_x = max((max(x) for _, x, _, _ in curves if len(x) > 0), default=1)
+    max_y = max((max(y) for _, _, y, _ in curves if len(y) > 0), default=1.0)
+
+    for label, x, y, m_key in curves:
+        style = {}
+        if styles:
+            if label in styles:
+                style = dict(styles[label])
+            elif m_key in styles:
+                style = dict(styles[m_key])
+        if "color" not in style:
+            norm_k = utils.normalize_method(m_key) or utils.normalize_method(label) or m_key
+            style["color"] = utils.method_color(norm_k)
+        if "linestyle" not in style:
+            norm_k = utils.normalize_method(m_key) or utils.normalize_method(label) or m_key
+            style["linestyle"] = utils.method_linestyle(norm_k)
+
+        plt.plot(x, y, label=label, marker='.', markersize=2, linewidth=1.5, alpha=0.9, **style)
+
+    if yscale == "log1p":
+        plt.yscale("function", functions=(np.log1p, np.expm1))
+    elif isinstance(yscale, (tuple, list)) and len(yscale) == 2:
+        plt.yscale("function", functions=yscale)
+    elif yscale and yscale != "linear":
+        plt.yscale(yscale)
+
+    plt.title(title, **TITLE_STYLE)
+    plt.xlabel("Supported by >= N segmentations", fontsize=AXIS_FONTSIZE)
+    plt.ylabel("Fraction of shared genome coverage", fontsize=AXIS_FONTSIZE)
+    if yscale != "log1p":
+        plt.ylim(0, max(1.05, max_y * 1.05))
+    plt.xlim(1, max_x)
+    plt.xticks(fontsize=TICK_FONTSIZE)
+    plt.yticks(fontsize=TICK_FONTSIZE)
+    plt.legend(bbox_to_anchor=(1.01, 1), loc='upper left', fontsize=LEGEND_FONTSIZE)
+    plt.grid(True, alpha=0.3)
+    save_fig(fig, out_path)
+
+
+def compute_stacked_consistency(state_depth_counts,
+                                fractions=(0.0, 0.01, 0.02, 0.03, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0),
+                                genome_size=None):
+    """Compute state fractions table for support thresholds (0%, 1%, 2%, 3%, 5%, 10%, 25%, 50%, 75%, 100%).
+
+    Returns a pd.DataFrame indexed by percentages (e.g. '0%', '1%', ..., '100%') with
+    columns as sorted state names and values as fraction of physical genome size G
+    supported by >= N(pct) segmentations.
+    """
+    if not state_depth_counts:
+        return pd.DataFrame()
+    M = max(max(d.keys()) for d in state_depth_counts.values())
+    if genome_size is not None:
+        G = genome_size
+    else:
+        G = compute_genome_size(state_depth_counts)
+    if G == 0:
+        return pd.DataFrame()
+
+    states = sorted(state_depth_counts.keys(), key=_natural_sort_key)
+    rows = []
+    labels = []
+    for frac in fractions:
+        pct = frac * 100.0 if frac <= 1.0 else frac
+        label = f"{int(round(pct))}%"
+        labels.append(label)
+        if pct == 0:
+            n = 1
+        elif pct == 100:
+            n = M
+        else:
+            n = max(1, min(M, int(round(pct / 100.0 * M))))
+
+        row = {}
+        for state in states:
+            depths = state_depth_counts[state]
+            shared = depths.get(M, 0) - depths.get(n - 1, 0)
+            row[state] = shared / G
+        rows.append(row)
+
+    return pd.DataFrame(rows, index=labels, columns=states)
+
+
+def plot_stacked_consistency(state_depth_counts, title, out_path, colors=None,
+                             fractions=(0.0, 0.01, 0.02, 0.03, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0),
+                             genome_size=None):
+    """Stacked bar plot of state fractions shared by at least 0%, 1%, 2%, 3%, 5%, 10%, 25%, 50%, 75%, 100% segmentations."""
+    if not state_depth_counts:
+        return
+    df = compute_stacked_consistency(state_depth_counts, fractions=fractions, genome_size=genome_size)
+    if df.empty:
+        return
+
+    color_list = None
+    if isinstance(colors, (list, tuple)):
+        color_list = list(colors)
+    else:
+        import summary_plots
+        sources = [colors] if isinstance(colors, dict) else []
+        palette = summary_plots.state_palette(df.columns, *sources)
+        color_list = [palette[s] for s in df.columns]
+
+    utils.stacked_bar_plot(
+        df,
+        colors=color_list,
+        figsize=(8, 5),
+        width=0.6,
+        rotation=0,
+        title=f"Method consistency ({title})",
+        xlabel="Supported by >= % segmentations",
+        ylabel="Fraction of shared genome coverage",
+        legend_title="State",
+        path=out_path
+    )
+
+
 def save_report(segs, outdir):
     """Save report.tsv with state-level statistics."""
     lengths = defaultdict(list)
