@@ -755,3 +755,78 @@ def test_plot_methods_consistency(tmp_path):
     analyze.plot_methods_consistency([], "Title", str(tmp_path / "empty.pdf"))
     analyze.plot_methods_consistency({}, "Title", str(tmp_path / "empty.pdf"))
     analyze.plot_methods_consistency(pd.DataFrame(), "Title", str(tmp_path / "empty.pdf"))
+
+
+def test_distance_tss_discordance(tmp_path):
+    """Test Distance-to-TSS tier computation, bed loading, discordance rate, and grid plotting."""
+    # 1. Create a dummy GTF file
+    gtf_file = tmp_path / "test.gtf"
+    gtf_lines = [
+        "# Dummy GTF",
+        "chr1\tHAVANA\tgene\t1001\t2000\t.\t+\t.\tgene_id \"G1\";",  # TSS = 1000
+        "chr1\tHAVANA\tgene\t10001\t12000\t.\t-\t.\tgene_id \"G2\";", # TSS = 11999
+        "chr2\tHAVANA\tgene\t501\t1500\t.\t+\t.\tgene_id \"G3\";",   # TSS = 500
+    ]
+    gtf_file.write_text("\n".join(gtf_lines))
+
+    chrom_sizes = {"chr1": 20000, "chr2": 10000}
+    dist_tiers = analyze.build_genome_tss_distance_bins(str(gtf_file), chrom_sizes, bin_size=200)
+
+    assert "chr1" in dist_tiers
+    assert "chr2" in dist_tiers
+    assert len(dist_tiers["chr1"]) == 100
+    assert len(dist_tiers["chr2"]) == 50
+
+    # chr1 bin 5 (midpoint = 5 * 200 + 100 = 1100): distance to TSS (1000) = 100 bp -> tier 0 ("0-500bp")
+    assert dist_tiers["chr1"][5] == 0
+
+    # 2. Create dummy BED files
+    bed_a_file = tmp_path / "test_a.bed"
+    bed_a_lines = [
+        "chr1\t0\t2000\t1_TssA",
+        "chr1\t2000\t10000\t7_Enh",
+        "chr1\t10000\t20000\t15_Quies",
+    ]
+    bed_a_file.write_text("\n".join(bed_a_lines))
+
+    bed_b_file = tmp_path / "test_b.bed"
+    bed_b_lines = [
+        "chr1\t0\t2000\t1_TssA",      # Matches bed_a
+        "chr1\t2000\t10000\t8_Tx",       # Mismatches bed_a
+        "chr1\t10000\t20000\t15_Quies", # Matches bed_a
+    ]
+    bed_b_file.write_text("\n".join(bed_b_lines))
+
+    codes_a = analyze.load_bed_codes(str(bed_a_file), chrom_sizes, bin_size=200)
+    codes_b = analyze.load_bed_codes(str(bed_b_file), chrom_sizes, bin_size=200)
+
+    assert "chr1" in codes_a
+    assert codes_a["chr1"][0] == analyze.STATE_CANONICAL_IDX["TssA"]
+
+    discordance = analyze.compute_distance_tss_discordance(codes_a, codes_b, dist_tiers)
+    assert len(discordance) == len(analyze.DISTANCE_TSS_LABELS)
+    assert 0.0 <= discordance[0] <= 1.0
+
+    # 3. Test grid plot with dummy data
+    rows = []
+    methods = [
+        utils.CHROMHMM_DEFAULT, utils.KMEANS_HOMER, utils.KMEANS_MACS2, utils.KMEANS_OMNI,
+        utils.JOINT_CHROMHMM, utils.JOINT_KMEANS_HOMER, utils.JOINT_KMEANS_MACS2, utils.JOINT_KMEANS_OMNI
+    ]
+    for m in methods:
+        for t in ["Between", "Replicate"]:
+            for lbl in analyze.DISTANCE_TSS_LABELS:
+                rows.append({"Method": m, "Type": t, "Distance": lbl, "Discordance": 0.25})
+
+    df_test = pd.DataFrame(rows)
+    outpath_grid = str(tmp_path / "distance_tss_grid.pdf")
+    analyze.plot_distance_tss_discordance_grid(df_test, out_path=outpath_grid)
+    assert os.path.exists(outpath_grid)
+
+    outpath_grid_4x1 = str(tmp_path / "distance_tss_grid_4x1.pdf")
+    analyze.plot_distance_tss_discordance_grid(df_test, layout=(4, 1), figsize=(8, 10), out_path=outpath_grid_4x1)
+    assert os.path.exists(outpath_grid_4x1)
+
+    outpath_grid_2x2 = str(tmp_path / "distance_tss_grid_2x2.pdf")
+    analyze.plot_distance_tss_discordance_grid(df_test, layout=(2, 2), figsize=(10, 7), out_path=outpath_grid_2x2)
+    assert os.path.exists(outpath_grid_2x2)

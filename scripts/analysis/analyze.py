@@ -17,6 +17,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import seaborn as sns
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -1660,3 +1661,234 @@ def compute_state_switch_enrichment(within_matrix, between_matrix, pseudocount=0
                 ratio = np.where(pw > 0, pb / pw, np.nan)
                 E_vals = np.where(ratio > 0, np.log10(ratio), np.nan)
         return E_vals
+
+
+# -----------------------------------------------------------------------------
+# Distance to TSS discordance curves (Layout 1: 4-Panel Grid by Method)
+# -----------------------------------------------------------------------------
+
+DISTANCE_TSS_BINS = (0, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000, np.inf)
+DISTANCE_TSS_LABELS = (
+    "0-500bp", "500-1kb", "1-2kb", "2-5kb", "5-10kb",
+    "10-20kb", "20-50kb", "50-100kb", ">100kb"
+)
+
+STATE_CANONICAL_ORDER = [
+    "TssA", "Tss", "TssAFlnk", "TssFlnk", "TssFlnkU", "TssFlnkD", "TxFlnk",
+    "Tx", "TxWk",
+    "EnhG", "EnhG1", "EnhG2",
+    "Enh", "Enh1", "Enh2", "EnhLo",
+    "ZNF/Rpts", "Het",
+    "TssBiv", "BivFlnk", "EnhBiv", "Biv",
+    "ReprPC", "ReprPCWk",
+    "Quies",
+    "Unknown",
+]
+STATE_CANONICAL_IDX = {s: i for i, s in enumerate(STATE_CANONICAL_ORDER)}
+
+
+def load_chrom_sizes(path):
+    """Load chromosome sizes from a two-column chrom.sizes file."""
+    sizes = {}
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    sizes[parts[0]] = int(parts[1])
+    return sizes
+
+
+def build_genome_tss_distance_bins(gtf_or_tss_path, chrom_sizes, bin_size=200,
+                                   distance_bins=DISTANCE_TSS_BINS):
+    """Build distance-to-nearest-TSS tier array for every genomic bin across chromosomes."""
+    from collections import defaultdict
+    import gzip
+
+    tss_by_chrom = defaultdict(list)
+    opener = gzip.open if str(gtf_or_tss_path).endswith(".gz") else open
+    with opener(gtf_or_tss_path, "rt") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            cols = line.rstrip("\n").split("\t")
+            if len(cols) >= 9 and cols[2] == "gene":
+                # GTF gene line
+                chrom, start, end, strand = cols[0], int(cols[3]) - 1, int(cols[4]), cols[6]
+                tss = start if strand == "+" else end - 1
+                tss_by_chrom[chrom].append(tss)
+            elif len(cols) >= 3 and not cols[1].isalpha():
+                # BED format (e.g. RefSeqTSS bed)
+                chrom, start, end = cols[0], int(cols[1]), int(cols[2])
+                tss = (start + end) // 2
+                tss_by_chrom[chrom].append(tss)
+
+    bin_dist_tiers = {}
+    for chrom, size in chrom_sizes.items():
+        if chrom not in tss_by_chrom or not tss_by_chrom[chrom]:
+            continue
+        tss_arr = np.sort(np.array(tss_by_chrom[chrom], dtype=np.int64))
+        nbins = (size + bin_size - 1) // bin_size
+        midpoints = np.arange(nbins, dtype=np.int64) * bin_size + (bin_size // 2)
+
+        idx = np.searchsorted(tss_arr, midpoints)
+        idx_left = np.clip(idx - 1, 0, len(tss_arr) - 1)
+        idx_right = np.clip(idx, 0, len(tss_arr) - 1)
+        dist = np.minimum(np.abs(midpoints - tss_arr[idx_left]), np.abs(midpoints - tss_arr[idx_right]))
+
+        tier = np.digitize(dist, distance_bins) - 1
+        bin_dist_tiers[chrom] = tier.astype(np.int8)
+
+    return bin_dist_tiers
+
+
+def load_bed_codes(bed_path, chrom_sizes, bin_size=200, state_map=None):
+    """Load a BED file and return state codes array per chromosome."""
+    if state_map is None:
+        state_map = STATE_CANONICAL_IDX
+
+    try:
+        df = pd.read_csv(
+            bed_path,
+            sep="\t",
+            header=None,
+            comment="#",
+            skiprows=_get_skiprows(bed_path),
+            usecols=[0, 1, 2, 3],
+            dtype={0: str, 1: np.int64, 2: np.int64, 3: str},
+            engine="c",
+            low_memory=False
+        )
+    except Exception:
+        bed = load_bed(bed_path)
+        df = pd.DataFrame(bed, columns=[0, 1, 2, 3])
+
+    codes = {}
+    for chrom, grp in df.groupby(0, sort=False):
+        if chrom not in chrom_sizes:
+            continue
+        nbins = (chrom_sizes[chrom] + bin_size - 1) // bin_size
+        arr = np.full(nbins, -1, dtype=np.int16)
+        starts = (grp[1].values // bin_size).clip(0, nbins)
+        ends = ((grp[2].values + bin_size - 1) // bin_size).clip(0, nbins)
+        names = grp[3].values
+        for s, e, name in zip(starts, ends, names):
+            s_clean = name.split("_", 1)[-1] if "_" in name and name.split("_", 1)[0].isdigit() else name
+            st_id = state_map.get(s_clean, state_map.get(name, 99))
+            arr[s:e] = st_id
+        codes[chrom] = arr
+    return codes
+
+
+def compute_distance_tss_discordance(codes_a, codes_b, dist_tiers, n_tiers=len(DISTANCE_TSS_LABELS)):
+    """Compute state discordance (mismatch rate) per distance tier between two segmentations."""
+    tier_mismatches = np.zeros(n_tiers, dtype=np.int64)
+    tier_totals = np.zeros(n_tiers, dtype=np.int64)
+
+    for chrom, tier in dist_tiers.items():
+        if chrom in codes_a and chrom in codes_b:
+            ca = codes_a[chrom]
+            cb = codes_b[chrom]
+            min_len = min(len(ca), len(cb), len(tier))
+            valid = (ca[:min_len] >= 0) & (cb[:min_len] >= 0)
+            mismatch = valid & (ca[:min_len] != cb[:min_len])
+
+            t = tier[:min_len]
+            tier_totals += np.bincount(t[valid], minlength=n_tiers)
+            tier_mismatches += np.bincount(t[mismatch], minlength=n_tiers)
+
+    rates = np.zeros(n_tiers, dtype=np.float64)
+    nz = tier_totals > 0
+    rates[nz] = tier_mismatches[nz] / tier_totals[nz]
+    return rates
+
+
+def plot_distance_tss_discordance_grid(df_results, title="State discordance vs. Distance to TSS",
+                                       out_path=None, distance_labels=DISTANCE_TSS_LABELS,
+                                       layout=(1, 4), figsize=(15, 3.8)):
+    """Plot Layout 1: 4-Panel Grid by Method (Method-Centric View).
+
+    Creates a 1x4 grid (or custom layout) where each panel represents one caller
+    (ChromHMM, Homer KMeans, MACS2 KMeans, OmniPeak KMeans) and compares Individual
+    vs Joint and Replicate vs Between-sample discordance curves as a function of
+    distance to nearest TSS.
+    """
+    panels = [
+        ("ChromHMM", utils.CHROMHMM_DEFAULT, utils.JOINT_CHROMHMM),
+        ("Homer KMeans", utils.KMEANS_HOMER, utils.JOINT_KMEANS_HOMER),
+        ("MACS2 KMeans", utils.KMEANS_MACS2, utils.JOINT_KMEANS_MACS2),
+        ("OmniPeak KMeans", utils.KMEANS_OMNI, utils.JOINT_KMEANS_OMNI)
+    ]
+
+    nrows, ncols = layout
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, sharex=True, sharey=True, squeeze=False)
+    x = np.arange(len(distance_labels))
+
+    for idx, (panel_title, ind_key, jnt_key) in enumerate(panels):
+        r = idx // ncols
+        c = idx % ncols
+        ax = axes[r, c]
+        c_ind = utils.method_color(ind_key)
+        c_jnt = utils.method_color(jnt_key)
+
+        if isinstance(df_results, pd.DataFrame):
+            df_ind_b = df_results[(df_results["Method"] == ind_key) & (df_results["Type"].isin(["Between", "Between-sample"]))]
+            df_ind_r = df_results[(df_results["Method"] == ind_key) & (df_results["Type"].isin(["Replicate", "Within-replicate"]))]
+            df_jnt_b = df_results[(df_results["Method"] == jnt_key) & (df_results["Type"].isin(["Between", "Between-sample"]))]
+            df_jnt_r = df_results[(df_results["Method"] == jnt_key) & (df_results["Type"].isin(["Replicate", "Within-replicate"]))]
+
+            ind_b = df_ind_b["Discordance"].values if not df_ind_b.empty else np.zeros(len(x))
+            ind_r = df_ind_r["Discordance"].values if not df_ind_r.empty else np.zeros(len(x))
+            jnt_b = df_jnt_b["Discordance"].values if not df_jnt_b.empty else np.zeros(len(x))
+            jnt_r = df_jnt_r["Discordance"].values if not df_jnt_r.empty else np.zeros(len(x))
+        elif isinstance(df_results, dict):
+            ind_b = df_results.get((ind_key, "Between"), np.zeros(len(x)))
+            ind_r = df_results.get((ind_key, "Replicate"), np.zeros(len(x)))
+            jnt_b = df_results.get((jnt_key, "Between"), np.zeros(len(x)))
+            jnt_r = df_results.get((jnt_key, "Replicate"), np.zeros(len(x)))
+        else:
+            ind_b, ind_r, jnt_b, jnt_r = np.zeros(len(x)), np.zeros(len(x)), np.zeros(len(x)), np.zeros(len(x))
+
+        if len(ind_b) == len(x) and np.any(ind_b > 0):
+            ax.plot(x, ind_b, color=c_ind, lw=2.0, marker="o", markersize=4)
+        if len(ind_r) == len(x) and np.any(ind_r > 0):
+            ax.plot(x, ind_r, color=c_ind, lw=1.5, ls="--", marker=".", markersize=4, alpha=0.7)
+        if len(jnt_b) == len(x) and np.any(jnt_b > 0):
+            ax.plot(x, jnt_b, color=c_jnt, lw=2.0, ls="-.", marker="s", markersize=4)
+        if len(jnt_r) == len(x) and np.any(jnt_r > 0):
+            ax.plot(x, jnt_r, color=c_jnt, lw=1.5, ls=":", marker="x", markersize=4, alpha=0.7)
+
+        ax.set_title(panel_title, fontsize=11, fontweight="bold")
+        ax.set_xticks(x)
+        ax.set_xticklabels(distance_labels, rotation=45, ha="right", fontsize=9)
+        ax.grid(True, linestyle=":", alpha=0.6)
+        ax.set_ylim(0, 0.7)
+
+        if c == 0:
+            ax.set_ylabel("State Discordance Rate", fontsize=10)
+        else:
+            ax.set_ylabel("")
+
+        if r == nrows - 1:
+            ax.set_xlabel("Distance to Nearest TSS", fontsize=10)
+        else:
+            ax.set_xlabel("")
+
+    legend_elements = [
+        Line2D([0], [0], color="grey", lw=2.0, ls="-", marker="o", markersize=4, label="Indiv — Between-sample"),
+        Line2D([0], [0], color="grey", lw=1.5, ls="--", marker=".", markersize=4, label="Indiv — Replicate"),
+        Line2D([0], [0], color="grey", lw=2.0, ls="-.", marker="s", markersize=4, label="Joint — Between-sample"),
+        Line2D([0], [0], color="grey", lw=1.5, ls=":", marker="x", markersize=4, label="Joint — Replicate"),
+    ]
+    last_ax = axes.flat[len(panels) - 1]
+    last_ax.legend(handles=legend_elements, bbox_to_anchor=(1.02, 1), loc="upper left",
+                   borderaxespad=0, fontsize=8, framealpha=0.9)
+
+    if title:
+        fig.suptitle(title, fontsize=12, fontweight="bold", y=1.005 if nrows > 1 else 1.02)
+
+    plt.tight_layout()
+    if out_path:
+        save_fig(fig, out_path)
+    return fig
