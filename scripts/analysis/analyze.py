@@ -636,12 +636,13 @@ def compute_genome_size(state_depth_counts):
     return total_sample_bins / M
 
 
-def compute_consistency_curve(state_depth_counts, exclude_quiescent=False, genome_size=None):
-    """Overall fraction of shared genome coverage supported by >= N segmentations.
+def compute_consistency_curve(state_depth_counts, exclude_quiescent=False, genome_size=None,
+                             fractions=None):
+    """Overall fraction of genome supported by >= N segmentations (or discrete fractions).
 
     Aggregates across all states (or excluding quiescent states) without split by states,
     normalized by the physical genome size G:
-    For N in 1..M, fraction(N) = sum_s(depths_s[M] - depths_s[N-1]) / G.
+    For N in 1..M (or discrete percentages), fraction(N) = sum_s(depths_s[M] - depths_s[N-1]) / G.
     """
     if not state_depth_counts:
         return []
@@ -660,19 +661,74 @@ def compute_consistency_curve(state_depth_counts, exclude_quiescent=False, genom
         if not state_depth_counts:
             return []
     curve = []
-    for n in range(1, M + 1):
-        shared = sum(depths[M] - depths.get(n - 1, 0) for depths in state_depth_counts.values())
-        curve.append((n, shared, shared / G))
+    if fractions is not None:
+        for frac in fractions:
+            pct = frac * 100.0 if frac <= 1.0 else frac
+            label = f"{int(round(pct))}%"
+            if pct == 0:
+                n = 1
+            elif pct == 100:
+                n = M
+            else:
+                n = max(1, min(M, int(round(pct / 100.0 * M))))
+            shared = sum(depths[M] - depths.get(n - 1, 0) for depths in state_depth_counts.values())
+            curve.append((label, shared, shared / G))
+    else:
+        for n in range(1, M + 1):
+            shared = sum(depths[M] - depths.get(n - 1, 0) for depths in state_depth_counts.values())
+            curve.append((n, shared, shared / G))
+    return curve
+
+
+def compute_quiescent_consistency_curve(state_depth_counts, genome_size=None, fractions=None):
+    """Fraction of Quiescent state among the shared genome coverage supported by >= N segmentations (or discrete fractions).
+
+    For N in 1..M (or discrete percentages):
+        shared_all = sum_{all s}(depths_s[M] - depths_s[N-1])
+        shared_quies = sum_{quiescent s}(depths_s[M] - depths_s[N-1])
+        fraction = shared_quies / shared_all if shared_all > 0 else 0.0
+    """
+    if not state_depth_counts:
+        return []
+    M = max(max(d.keys()) for d in state_depth_counts.values())
+    if M == 0:
+        return []
+    curve = []
+    if fractions is not None:
+        for frac in fractions:
+            pct = frac * 100.0 if frac <= 1.0 else frac
+            label = f"{int(round(pct))}%"
+            if pct == 0:
+                n = 1
+            elif pct == 100:
+                n = M
+            else:
+                n = max(1, min(M, int(round(pct / 100.0 * M))))
+            shared_all = sum(depths[M] - depths.get(n - 1, 0) for depths in state_depth_counts.values())
+            shared_quies = sum(depths[M] - depths.get(n - 1, 0) for s, depths in state_depth_counts.items() if utils.is_quiescent(s))
+            q_frac = shared_quies / shared_all if shared_all > 0 else 0.0
+            curve.append((label, shared_quies, q_frac))
+    else:
+        for n in range(1, M + 1):
+            shared_all = sum(depths[M] - depths.get(n - 1, 0) for depths in state_depth_counts.values())
+            shared_quies = sum(depths[M] - depths.get(n - 1, 0) for s, depths in state_depth_counts.items() if utils.is_quiescent(s))
+            q_frac = shared_quies / shared_all if shared_all > 0 else 0.0
+            curve.append((n, shared_quies, q_frac))
     return curve
 
 
 def plot_method_consistency(state_depth_counts, title, out_path, color=None, linestyle=None,
-                            exclude_quiescent=False, yscale="linear", genome_size=None):
-    """Plot consistency curve without split by states: fraction of shared coverage by >= N epigenomes."""
+                            exclude_quiescent=False, quiescent_fraction=False, yscale="linear",
+                            genome_size=None, fractions=None, xlabel=None, ylabel=None,
+                            figsize=(8, 4)):
+    """Plot consistency curve without split by states: fraction of genome supported by >= N epigenomes."""
     if not state_depth_counts:
         return
-    curve = compute_consistency_curve(state_depth_counts, exclude_quiescent=exclude_quiescent,
-                                    genome_size=genome_size)
+    if quiescent_fraction:
+        curve = compute_quiescent_consistency_curve(state_depth_counts, genome_size=genome_size, fractions=fractions)
+    else:
+        curve = compute_consistency_curve(state_depth_counts, exclude_quiescent=exclude_quiescent,
+                                        genome_size=genome_size, fractions=fractions)
     if not curve:
         return
     x = [n for n, _, _ in curve]
@@ -685,8 +741,10 @@ def plot_method_consistency(state_depth_counts, title, out_path, color=None, lin
         norm_k = utils.normalize_method(title) or title
         linestyle = utils.method_linestyle(norm_k)
 
-    fig = plt.figure(figsize=(8, 5))
-    plt.plot(x, y, label=title, marker='.', markersize=2, color=color, linestyle=linestyle, alpha=0.9)
+    fig = plt.figure(figsize=figsize)
+    is_discrete = len(x) > 0 and isinstance(x[0], str)
+    plot_x = range(len(x)) if is_discrete else x
+    plt.plot(plot_x, y, label=title, marker='.', markersize=4 if is_discrete else 2, color=color, linestyle=linestyle, alpha=0.9)
     if yscale == "log1p":
         plt.yscale("function", functions=(np.log1p, np.expm1))
     elif isinstance(yscale, (tuple, list)) and len(yscale) == 2:
@@ -694,33 +752,45 @@ def plot_method_consistency(state_depth_counts, title, out_path, color=None, lin
     elif yscale and yscale != "linear":
         plt.yscale(yscale)
     plt.title(f"Method consistency ({title})", **TITLE_STYLE)
-    plt.xlabel("Supported by >= N segmentations", fontsize=AXIS_FONTSIZE)
-    plt.ylabel("Fraction of shared genome coverage", fontsize=AXIS_FONTSIZE)
+    default_xlabel = "Supported by >= % segmentations" if is_discrete else "Supported by >= N segmentations"
+    plt.xlabel(xlabel or default_xlabel, fontsize=AXIS_FONTSIZE)
+    default_ylabel = "Fraction of Quiescent state" if quiescent_fraction else "Fraction of genome"
+    plt.ylabel(ylabel or default_ylabel, fontsize=AXIS_FONTSIZE)
     max_y = max(y) if y else 1.0
-    if yscale != "log1p":
+    if yscale not in ("log", "symlog"):
         plt.ylim(0, max(1.05, max_y * 1.05))
-    plt.xlim(1, max(x))
-    plt.xticks(fontsize=TICK_FONTSIZE)
+    if is_discrete:
+        plt.xlim(0, len(x) - 1)
+        plt.xticks(range(len(x)), x, fontsize=TICK_FONTSIZE)
+    else:
+        plt.xlim(1, max(x))
+        plt.xticks(fontsize=TICK_FONTSIZE)
     plt.yticks(fontsize=TICK_FONTSIZE)
     plt.grid(True, alpha=0.3)
     save_fig(fig, out_path)
 
 
 def plot_methods_consistency(methods_data, title, out_path, styles=None, exclude_quiescent=False,
-                            yscale="linear", genome_size=None):
+                            quiescent_fraction=False, yscale="linear", genome_size=None,
+                            fractions=None, xlabel=None, ylabel=None, figsize=(8, 4)):
     """Plot consistency curves for multiple methods on a single figure with project-wide styling.
 
     *methods_data*:
         - dict of {label: state_depth_counts}
         - or list of tuples: (label, state_depth_counts, [method_key])
         - or list of dicts: [{'title': ..., 'counts': ..., 'slug': ...}, ...]
-        - or pd.DataFrame with ['N', 'Fraction', 'Model'] columns
+        - or pd.DataFrame with ['N' or 'Percent', 'Fraction', 'Model'] columns
     *title*: figure title
     *out_path*: output file path
     *styles*: optional dict mapping label or method key to dict(color=..., linestyle=...)
     *exclude_quiescent*: whether to ignore quiescent states when computing curves from counts
+    *quiescent_fraction*: whether to compute fraction of Quiescent state among shared coverage
     *yscale*: y-axis scale ('linear', 'log1p', 'log', 'symlog', or tuple of functions)
     *genome_size*: optional genome size G for normalization when computing from counts
+    *fractions*: optional tuple of fractional thresholds for discrete x-axis
+    *xlabel*: optional custom x-axis label
+    *ylabel*: optional custom y-axis label
+    *figsize*: figure size tuple (default: (8, 4))
     """
     if methods_data is None:
         return
@@ -731,14 +801,21 @@ def plot_methods_consistency(methods_data, title, out_path, styles=None, exclude
 
     curves = []
     if isinstance(methods_data, pd.DataFrame):
+        x_col = "Percent" if "Percent" in methods_data.columns else ("N" if "N" in methods_data.columns else methods_data.columns[0])
         for model_name, group in methods_data.groupby("Model", sort=False):
-            x = group["N"].values
+            x = group[x_col].values
             y = group["Fraction"].values
             slug = group["Slug"].iloc[0] if "Slug" in group.columns else None
             curves.append((model_name, x, y, slug or model_name))
     elif isinstance(methods_data, dict):
         for label, counts in methods_data.items():
-            curve = compute_consistency_curve(counts, exclude_quiescent=exclude_quiescent, genome_size=genome_size) if isinstance(counts, dict) else counts
+            if isinstance(counts, dict):
+                if quiescent_fraction:
+                    curve = compute_quiescent_consistency_curve(counts, genome_size=genome_size, fractions=fractions)
+                else:
+                    curve = compute_consistency_curve(counts, exclude_quiescent=exclude_quiescent, genome_size=genome_size, fractions=fractions)
+            else:
+                curve = counts
             if curve:
                 x = [n for n, _, _ in curve]
                 y = [frac for _, _, frac in curve]
@@ -755,7 +832,13 @@ def plot_methods_consistency(methods_data, title, out_path, styles=None, exclude
                 method_key = item[2] if len(item) > 2 else label
             else:
                 continue
-            curve = compute_consistency_curve(counts, exclude_quiescent=exclude_quiescent, genome_size=genome_size) if isinstance(counts, dict) else counts
+            if isinstance(counts, dict):
+                if quiescent_fraction:
+                    curve = compute_quiescent_consistency_curve(counts, genome_size=genome_size, fractions=fractions)
+                else:
+                    curve = compute_consistency_curve(counts, exclude_quiescent=exclude_quiescent, genome_size=genome_size, fractions=fractions)
+            else:
+                curve = counts
             if curve:
                 x = [n for n, _, _ in curve]
                 y = [frac for _, _, frac in curve]
@@ -764,8 +847,12 @@ def plot_methods_consistency(methods_data, title, out_path, styles=None, exclude
     if not curves:
         return
 
-    fig = plt.figure(figsize=(8, 5))
-    max_x = max((max(x) for _, x, _, _ in curves if len(x) > 0), default=1)
+    fig = plt.figure(figsize=figsize)
+    is_discrete = len(curves[0][1]) > 0 and isinstance(curves[0][1][0], str)
+    if is_discrete:
+        x_labels = list(dict.fromkeys(curves[0][1]))
+
+    max_x = max((max(x) for _, x, _, _ in curves if len(x) > 0), default=1) if not is_discrete else len(x_labels) - 1
     max_y = max((max(y) for _, _, y, _ in curves if len(y) > 0), default=1.0)
 
     for label, x, y, m_key in curves:
@@ -782,7 +869,8 @@ def plot_methods_consistency(methods_data, title, out_path, styles=None, exclude
             norm_k = utils.normalize_method(m_key) or utils.normalize_method(label) or m_key
             style["linestyle"] = utils.method_linestyle(norm_k)
 
-        plt.plot(x, y, label=label, marker='.', markersize=2, linewidth=1.5, alpha=0.9, **style)
+        plot_x = range(len(x)) if is_discrete else x
+        plt.plot(plot_x, y, label=label, marker='.', markersize=4 if is_discrete else 2, linewidth=1.5, alpha=0.9, **style)
 
     if yscale == "log1p":
         plt.yscale("function", functions=(np.log1p, np.expm1))
@@ -792,12 +880,18 @@ def plot_methods_consistency(methods_data, title, out_path, styles=None, exclude
         plt.yscale(yscale)
 
     plt.title(title, **TITLE_STYLE)
-    plt.xlabel("Supported by >= N segmentations", fontsize=AXIS_FONTSIZE)
-    plt.ylabel("Fraction of shared genome coverage", fontsize=AXIS_FONTSIZE)
-    if yscale != "log1p":
+    default_xlabel = "Supported by >= % segmentations" if is_discrete else "Supported by >= N segmentations"
+    plt.xlabel(xlabel or default_xlabel, fontsize=AXIS_FONTSIZE)
+    default_ylabel = "Fraction of Quiescent state" if quiescent_fraction else "Fraction of genome"
+    plt.ylabel(ylabel or default_ylabel, fontsize=AXIS_FONTSIZE)
+    if yscale not in ("log", "symlog"):
         plt.ylim(0, max(1.05, max_y * 1.05))
-    plt.xlim(1, max_x)
-    plt.xticks(fontsize=TICK_FONTSIZE)
+    if is_discrete:
+        plt.xlim(0, len(x_labels) - 1)
+        plt.xticks(range(len(x_labels)), x_labels, fontsize=TICK_FONTSIZE)
+    else:
+        plt.xlim(1, max_x)
+        plt.xticks(fontsize=TICK_FONTSIZE)
     plt.yticks(fontsize=TICK_FONTSIZE)
     plt.legend(bbox_to_anchor=(1.01, 1), loc='upper left', fontsize=LEGEND_FONTSIZE)
     plt.grid(True, alpha=0.3)
@@ -805,11 +899,11 @@ def plot_methods_consistency(methods_data, title, out_path, styles=None, exclude
 
 
 def compute_stacked_consistency(state_depth_counts,
-                                fractions=(0.0, 0.01, 0.02, 0.03, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0),
+                                fractions=(0.0, 0.02, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.98, 1.0),
                                 genome_size=None):
-    """Compute state fractions table for support thresholds (0%, 1%, 2%, 3%, 5%, 10%, 25%, 50%, 75%, 100%).
+    """Compute state fractions table for support thresholds (0%, 2%, 5%, 10%, 25%, 50%, 75%, 90%, 95%, 98%, 100%).
 
-    Returns a pd.DataFrame indexed by percentages (e.g. '0%', '1%', ..., '100%') with
+    Returns a pd.DataFrame indexed by percentages (e.g. '0%', '2%', ..., '100%') with
     columns as sorted state names and values as fraction of physical genome size G
     supported by >= N(pct) segmentations.
     """
@@ -848,9 +942,9 @@ def compute_stacked_consistency(state_depth_counts,
 
 
 def plot_stacked_consistency(state_depth_counts, title, out_path, colors=None,
-                             fractions=(0.0, 0.01, 0.02, 0.03, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0),
-                             genome_size=None):
-    """Stacked bar plot of state fractions shared by at least 0%, 1%, 2%, 3%, 5%, 10%, 25%, 50%, 75%, 100% segmentations."""
+                             fractions=(0.0, 0.02, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.98, 1.0),
+                             genome_size=None, xlabel=None, ylabel=None):
+    """Stacked bar plot of state fractions shared by at least 0%, 2%, 5%, 10%, 25%, 50%, 75%, 90%, 95%, 98%, 100% segmentations."""
     if not state_depth_counts:
         return
     df = compute_stacked_consistency(state_depth_counts, fractions=fractions, genome_size=genome_size)
@@ -873,8 +967,8 @@ def plot_stacked_consistency(state_depth_counts, title, out_path, colors=None,
         width=0.6,
         rotation=0,
         title=f"Method consistency ({title})",
-        xlabel="Supported by >= % segmentations",
-        ylabel="Fraction of shared genome coverage",
+        xlabel=xlabel or "Supported by >= % segmentations",
+        ylabel=ylabel or "Fraction of genome",
         legend_title="State",
         path=out_path
     )
@@ -1312,3 +1406,257 @@ def run_analyze(seg, bin_size, outdir, inputs=None, annotations=None,
         enrich_df = compute_enrichment(segs, annotation_items)
         save_enrichment_table(enrich_df, outdir)
         plot_enrichment(enrich_df, segs, outdir)
+
+
+# ---------------------------------------------------------------------------
+# State-switch analysis (Nature Figure 5c)
+# ---------------------------------------------------------------------------
+
+def compute_pair_state_overlap_matrix(ref_segs, work_segs, states=None, families=None,
+                                      map_to_family=False, ref_index=None):
+    """Compute state overlap count matrix C_ij(A, B) between two segmentations.
+
+    C_ij(A, B) is the number of base pairs assigned state A in annotation i (ref_segs)
+    and state B in annotation j (work_segs).
+
+    If map_to_family is True, maps states to their functional state families.
+    Returns a pd.DataFrame with index as source states/families (annotation i)
+    and columns as destination states/families (annotation j).
+    """
+    _rules_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "rules"))
+    if _rules_dir not in sys.path:
+        sys.path.insert(0, _rules_dir)
+    import match
+
+    if isinstance(ref_segs, (str, os.PathLike)):
+        ref_segs = load_bed(ref_segs)
+    if isinstance(work_segs, (str, os.PathLike)):
+        work_segs = load_bed(work_segs)
+
+    # pair_overlap returns {(wname, rname): bp} where wname is state in work_segs (j)
+    # and rname is state in ref_segs (i).
+    ov_dict = match.pair_overlap(ref_segs, work_segs, ref_index=ref_index)
+
+    if map_to_family:
+        order = list(families) if families is not None else list(utils.STATE_FAMILY_ORDER)
+        counts = defaultdict(int)
+        for (wname, rname), bp in ov_dict.items():
+            rfam = utils.state_to_family(rname)
+            wfam = utils.state_to_family(wname)
+            counts[(rfam, wfam)] += bp
+        df = pd.DataFrame(
+            [[counts.get((r, w), 0) for w in order] for r in order],
+            index=order, columns=order
+        )
+        return df
+    else:
+        if states is None:
+            states_set = set()
+            for wname, rname in ov_dict:
+                states_set.add(rname)
+                states_set.add(wname)
+            order = sorted(states_set)
+        else:
+            order = list(states)
+        counts = defaultdict(int)
+        for (wname, rname), bp in ov_dict.items():
+            counts[(rname, wname)] += bp
+        df = pd.DataFrame(
+            [[counts.get((r, w), 0) for w in order] for r in order],
+            index=order, columns=order
+        )
+        return df
+
+
+def fold_state_overlap_to_families(matrix_or_dict, family_order=None):
+    """Aggregate a state-by-state matrix or {(state_j, state_i): bp} dict into state families."""
+    order = list(family_order) if family_order is not None else list(utils.STATE_FAMILY_ORDER)
+    if isinstance(matrix_or_dict, pd.DataFrame):
+        df = matrix_or_dict.copy()
+        row_fams = [utils.state_to_family(s) for s in df.index]
+        col_fams = [utils.state_to_family(s) for s in df.columns]
+        df.index = row_fams
+        df.columns = col_fams
+        df_fam = df.groupby(level=0).sum().T.groupby(level=0).sum().T
+        return df_fam.reindex(index=order, columns=order, fill_value=0)
+    elif isinstance(matrix_or_dict, dict):
+        counts = defaultdict(int)
+        for key, bp in matrix_or_dict.items():
+            if isinstance(key, tuple) and len(key) == 2:
+                # In pair_overlap dictionary, key is (state_in_j, state_in_i)
+                # We map state_in_i -> source family, state_in_j -> destination family
+                s_j, s_i = key
+                f_i, f_j = utils.state_to_family(s_i), utils.state_to_family(s_j)
+                counts[(f_i, f_j)] += bp
+        return pd.DataFrame(
+            [[counts.get((r, c), 0) for c in order] for r in order],
+            index=order, columns=order
+        )
+    else:
+        raise TypeError("matrix_or_dict must be a pd.DataFrame or dict")
+
+
+def symmetrize_state_overlap_matrix(C):
+    """Symmetrize pair state overlap matrix: S_ij = C_ij + C_ij^T."""
+    if isinstance(C, pd.DataFrame):
+        return C + C.T
+    elif isinstance(C, np.ndarray):
+        return C + C.T
+    elif isinstance(C, dict):
+        s = defaultdict(int)
+        for (a, b), val in C.items():
+            s[(a, b)] += val
+            s[(b, a)] += val
+        return s
+    else:
+        raise TypeError("Input must be a pd.DataFrame, np.ndarray, or dict")
+
+
+def aggregate_state_switch_matrices(matrices, mode="pooled", sample_groups=None):
+    """Aggregate symmetrized pair matrices into within- or between-condition matrix M.
+
+    Parameters
+    ----------
+    matrices : list or dict
+        Collection of symmetrized matrices (pd.DataFrame or np.ndarray).
+        If sample_groups is provided for 'balanced' mode, matrices can be:
+        - a dict mapping (sample_i, sample_j) -> S_ij
+        - or a list of tuples ((sample_i, sample_j), S_ij)
+    mode : str, 'pooled' or 'balanced'
+        'pooled': direct sum over all pair matrices (M = sum S_ij).
+        'balanced': equal weight per biological condition (or condition pair),
+                    averaging within each condition / condition pair before aggregating.
+    sample_groups : dict, optional
+        Mapping from sample_id -> group_id (e.g. {"E001": "ESC", ...}).
+
+    Returns
+    -------
+    pd.DataFrame or np.ndarray: aggregated matrix M.
+    """
+    if not matrices:
+        raise ValueError("matrices cannot be empty")
+
+    if mode == "pooled":
+        if isinstance(matrices, dict):
+            mat_list = list(matrices.values())
+        elif isinstance(matrices[0], tuple) and len(matrices[0]) == 2:
+            mat_list = [m for _, m in matrices]
+        else:
+            mat_list = list(matrices)
+
+        total = mat_list[0].copy()
+        for m in mat_list[1:]:
+            total = total + m
+        return total
+
+    elif mode == "balanced":
+        if isinstance(matrices, dict):
+            pair_items = list(matrices.items())
+        elif isinstance(matrices[0], tuple) and len(matrices[0]) == 2:
+            pair_items = list(matrices)
+        else:
+            mat_list = list(matrices)
+            total = mat_list[0].copy()
+            for m in mat_list[1:]:
+                total = total + m
+            return total / len(mat_list)
+
+        if sample_groups is None:
+            mat_list = [m for _, m in pair_items]
+            total = mat_list[0].copy()
+            for m in mat_list[1:]:
+                total = total + m
+            return total / len(mat_list)
+
+        grouped_mats = defaultdict(list)
+        for (id1, id2), mat in pair_items:
+            g1 = sample_groups.get(id1, id1)
+            g2 = sample_groups.get(id2, id2)
+            cond_key = tuple(sorted([str(g1), str(g2)]))
+            grouped_mats[cond_key].append(mat)
+
+        cond_means = []
+        for cond_key, m_list in grouped_mats.items():
+            grp_sum = m_list[0].copy()
+            for m in m_list[1:]:
+                grp_sum = grp_sum + m
+            cond_means.append(grp_sum / len(m_list))
+
+        total = cond_means[0].copy()
+        for m in cond_means[1:]:
+            total = total + m
+        return total / len(cond_means)
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}, expected 'pooled' or 'balanced'")
+
+
+def compute_state_switch_probabilities(M):
+    """Convert matrix M into row-normalized transition probabilities P(B | A).
+
+    For each source state A:
+        P(B | A) = M(A, B) / sum_C M(A, C)
+
+    The diagonal is kept in the denominator.
+    """
+    if isinstance(M, pd.DataFrame):
+        row_sums = M.sum(axis=1)
+        P = M.div(row_sums.replace(0, np.nan), axis=0).fillna(0.0)
+        return P
+    elif isinstance(M, np.ndarray):
+        row_sums = M.sum(axis=1, keepdims=True)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            P = np.where(row_sums > 0, M / row_sums, 0.0)
+        return P
+    else:
+        raise TypeError("Input M must be a pd.DataFrame or np.ndarray")
+
+
+def compute_state_switch_enrichment(within_matrix, between_matrix, pseudocount=0.0):
+    """Calculate state-switch enrichment E(A, B) = log10(P_between(B|A) / P_within(B|A)).
+
+    Parameters
+    ----------
+    within_matrix : pd.DataFrame or np.ndarray
+        Counts M_within or probabilities P_within.
+    between_matrix : pd.DataFrame or np.ndarray
+        Counts M_between or probabilities P_between.
+    pseudocount : float, optional
+        Small constant added to probabilities before taking ratio/log (default 0.0).
+
+    Returns
+    -------
+    pd.DataFrame or np.ndarray
+        Matrix of log10 relative enrichments E(A, B).
+    """
+    P_within = compute_state_switch_probabilities(within_matrix)
+    P_between = compute_state_switch_probabilities(between_matrix)
+
+    if isinstance(P_within, pd.DataFrame) and isinstance(P_between, pd.DataFrame):
+        common_idx = [i for i in P_within.index if i in P_between.index]
+        common_cols = [c for c in P_within.columns if c in P_between.columns]
+        pw = P_within.loc[common_idx, common_cols].values
+        pb = P_between.loc[common_idx, common_cols].values
+
+        if pseudocount > 0:
+            ratio = (pb + pseudocount) / (pw + pseudocount)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                E_vals = np.log10(ratio)
+        else:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ratio = np.where(pw > 0, pb / pw, np.nan)
+                E_vals = np.where(ratio > 0, np.log10(ratio), np.nan)
+
+        return pd.DataFrame(E_vals, index=common_idx, columns=common_cols)
+    else:
+        pw = np.asarray(P_within, dtype=float)
+        pb = np.asarray(P_between, dtype=float)
+        if pseudocount > 0:
+            ratio = (pb + pseudocount) / (pw + pseudocount)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                E_vals = np.log10(ratio)
+        else:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ratio = np.where(pw > 0, pb / pw, np.nan)
+                E_vals = np.where(ratio > 0, np.log10(ratio), np.nan)
+        return E_vals

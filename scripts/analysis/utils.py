@@ -189,6 +189,67 @@ QUIESCENT = "Quiescent"
 FACULTATIVE_HET = "FacultativeHet"
 CONSTITUTIVE_HET = "ConstitutiveHet"
 
+# State families: mapping from canonical and de-novo state names to broad functional families
+STATE_FAMILIES = {
+    "Promoter": (
+        "Tss", "TssA", "TssAFlnk", "TssFlnk", "TssFlnkU", "TssFlnkD",
+        "Promoter", "PromoterFlanking",
+    ),
+    "Enhancer": (
+        "Enh", "Enh1", "Enh2", "EnhG", "EnhG1", "EnhG2", "EnhLo",
+        "Enhancer", "EnhancerLow",
+    ),
+    "Transcribed": (
+        "Tx", "TxWk", "TxFlnk", "Transcribed",
+    ),
+    "Bivalent": (
+        "Biv", "TssBiv", "BivFlnk", "EnhBiv", "Bivalent",
+    ),
+    "Polycomb": (
+        "ReprPC", "ReprPCWk", FACULTATIVE_HET,
+    ),
+    "Heterochromatin": (
+        "Het", "ZNF/Rpts", CONSTITUTIVE_HET, "K9K36",
+    ),
+    "Quiescent": (
+        "Quies", QUIESCENT,
+    ),
+}
+FAMILY_OF = {
+    state: family for family, states in STATE_FAMILIES.items() for state in states
+}
+STATE_FAMILY_ORDER = [
+    "Promoter", "Enhancer", "Transcribed", "Bivalent", "Polycomb", "Heterochromatin", "Quiescent"
+]
+
+STATE_FAMILY_COLORS = {
+    "Promoter": "#FF0000",
+    "Enhancer": "#FFDF00",
+    "Transcribed": "#008000",
+    "Bivalent": "#CD5C5C",
+    "Polycomb": "#8937DF",
+    "Heterochromatin": "#4B0082",
+    "Quiescent": "#888888",
+}
+
+STATE_FAMILY_MARKERS = {
+    "Promoter": "o",
+    "Enhancer": "s",
+    "Transcribed": "^",
+    "Bivalent": "D",
+    "Polycomb": "v",
+    "Heterochromatin": "p",
+    "Quiescent": "X",
+}
+
+
+def state_to_family(state):
+    """Map a state name to its functional state family, or the normalized name if unmapped."""
+    if state is None:
+        return "Unknown"
+    norm = normalize_state_name(state)
+    return FAMILY_OF.get(norm, FAMILY_OF.get(state, norm))
+
 # Canonical keys
 CHROMHMM_DEFAULT = "chromhmm_default"
 CHROMHMM_HOMER = "chromhmm_homer"

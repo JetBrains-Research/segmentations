@@ -510,7 +510,7 @@ def test_plot_method_consistency(tmp_path):
         "2_Quies": {1: 5, 2: 30},
     }
     outpath = str(tmp_path / "method_consistency.pdf")
-    analyze.plot_method_consistency(counts, "Test Model", outpath)
+    analyze.plot_method_consistency(counts, "Test Model", outpath, ylabel="Fraction of genome")
     assert os.path.exists(outpath)
 
     outpath_no_quies = str(tmp_path / "method_consistency_no_quies.pdf")
@@ -533,15 +533,21 @@ def test_compute_stacked_consistency():
     # 75%: n = 3 -> StateA: (20-15)/38 = 5/38, StateB: (60-45)/38 = 15/38
     # 100%: n = 4 -> StateA: (20-18)/38 = 2/38, StateB: (60-50)/38 = 10/38
     df = analyze.compute_stacked_consistency(counts)
-    expected_indices = ["0%", "1%", "2%", "3%", "5%", "10%", "25%", "50%", "75%", "100%"]
+    expected_indices = ["0%", "2%", "5%", "10%", "25%", "50%", "75%", "90%", "95%", "98%", "100%"]
     assert list(df.index) == expected_indices
     assert list(df.columns) == ["StateA", "StateB"]
     assert df.loc["0%", "StateA"] == pytest.approx(20.0 / 38.0)
     assert df.loc["0%", "StateB"] == pytest.approx(60.0 / 38.0)
-    assert df.loc["1%", "StateA"] == pytest.approx(20.0 / 38.0)
+    assert df.loc["2%", "StateA"] == pytest.approx(20.0 / 38.0)
     assert df.loc["10%", "StateA"] == pytest.approx(20.0 / 38.0)
     assert df.loc["50%", "StateA"] == pytest.approx(10.0 / 38.0)
     assert df.loc["50%", "StateB"] == pytest.approx(30.0 / 38.0)
+    assert df.loc["75%", "StateA"] == pytest.approx(5.0 / 38.0)
+    assert df.loc["75%", "StateB"] == pytest.approx(15.0 / 38.0)
+    assert df.loc["90%", "StateA"] == pytest.approx(2.0 / 38.0)
+    assert df.loc["90%", "StateB"] == pytest.approx(10.0 / 38.0)
+    assert df.loc["95%", "StateA"] == pytest.approx(2.0 / 38.0)
+    assert df.loc["98%", "StateA"] == pytest.approx(2.0 / 38.0)
     assert df.loc["100%", "StateA"] == pytest.approx(2.0 / 38.0)
     assert df.loc["100%", "StateB"] == pytest.approx(10.0 / 38.0)
 
@@ -566,10 +572,20 @@ def test_compute_stacked_consistency():
     # G = 151500 / 100 = 1515.0
     df_100 = analyze.compute_stacked_consistency(counts_100)
     assert list(df_100.index) == expected_indices
-    # 1%: n = round(0.01 * 100) = 1 -> StateA: 1000 / 1515
+    # 2%: n = round(0.02 * 100) = 2 -> StateA: (1000 - 10) / 1515 = 990 / 1515
     # 10%: n = round(0.10 * 100) = 10 -> StateA: (1000 - 90) / 1515 = 910 / 1515
-    assert df_100.loc["1%", "StateA"] == pytest.approx(1000.0 / 1515.0)
+    # 75%: n = round(0.75 * 100) = 75 -> StateA: (1000 - 740) / 1515 = 260 / 1515
+    # 90%: n = round(0.90 * 100) = 90 -> StateA: (1000 - 890) / 1515 = 110 / 1515
+    # 95%: n = round(0.95 * 100) = 95 -> StateA: (1000 - 940) / 1515 = 60 / 1515
+    # 98%: n = round(0.98 * 100) = 98 -> StateA: (1000 - 970) / 1515 = 30 / 1515
+    # 100%: n = 100 -> StateA: (1000 - 990) / 1515 = 10 / 1515
+    assert df_100.loc["2%", "StateA"] == pytest.approx(990.0 / 1515.0)
     assert df_100.loc["10%", "StateA"] == pytest.approx(910.0 / 1515.0)
+    assert df_100.loc["75%", "StateA"] == pytest.approx(260.0 / 1515.0)
+    assert df_100.loc["90%", "StateA"] == pytest.approx(110.0 / 1515.0)
+    assert df_100.loc["95%", "StateA"] == pytest.approx(60.0 / 1515.0)
+    assert df_100.loc["98%", "StateA"] == pytest.approx(30.0 / 1515.0)
+    assert df_100.loc["100%", "StateA"] == pytest.approx(10.0 / 1515.0)
 
     # Empty counts
     assert analyze.compute_stacked_consistency({}).empty
@@ -583,7 +599,7 @@ def test_plot_stacked_consistency(tmp_path):
     # With custom colors dict (hex and rgb string)
     colors = {"1_TssA": "#FF0000", "2_Quies": "255,255,255"}
     outpath = str(tmp_path / "stacked_consistency_custom.pdf")
-    analyze.plot_stacked_consistency(counts, "Test Model", outpath, colors=colors)
+    analyze.plot_stacked_consistency(counts, "Test Model", outpath, colors=colors, ylabel="Fraction of genome")
     assert os.path.exists(outpath)
 
     # With colors=None (falls back to canonical markup state colors)
@@ -630,7 +646,7 @@ def test_plot_methods_consistency(tmp_path):
         ("De-novo Joint Homer KMeans", counts_b, "joint_kmeans_homer"),
     ]
     outpath_list = str(tmp_path / "consistency_methods_list.pdf")
-    analyze.plot_methods_consistency(models, "Method consistency (w=0)", outpath_list)
+    analyze.plot_methods_consistency(models, "Method consistency", outpath_list)
     assert os.path.exists(outpath_list)
 
     # Test with DataFrame
@@ -644,7 +660,7 @@ def test_plot_methods_consistency(tmp_path):
     df_all = pd.concat(df_list, ignore_index=True)
 
     outpath_df = str(tmp_path / "consistency_methods_df.pdf")
-    analyze.plot_methods_consistency(df_all, "Method consistency (w=0)", outpath_df)
+    analyze.plot_methods_consistency(df_all, "Method consistency", outpath_df)
     assert os.path.exists(outpath_df)
 
     # Test with dict
@@ -653,7 +669,7 @@ def test_plot_methods_consistency(tmp_path):
         "Joint ChromHMM": counts_b,
     }
     outpath_dict = str(tmp_path / "consistency_methods_dict.pdf")
-    analyze.plot_methods_consistency(dict_data, "Method consistency (w=0)", outpath_dict)
+    analyze.plot_methods_consistency(dict_data, "Method consistency", outpath_dict, ylabel="Fraction of genome")
     assert os.path.exists(outpath_dict)
 
     # Test with custom styles
@@ -662,22 +678,78 @@ def test_plot_methods_consistency(tmp_path):
         "Joint ChromHMM": {"color": "#00FF00", "linestyle": "-."},
     }
     outpath_styles = str(tmp_path / "consistency_methods_styles.pdf")
-    analyze.plot_methods_consistency(dict_data, "Method consistency (w=0)", outpath_styles, styles=custom_styles)
+    analyze.plot_methods_consistency(dict_data, "Method consistency", outpath_styles, styles=custom_styles)
     assert os.path.exists(outpath_styles)
 
     # Test with exclude_quiescent=True
     outpath_no_quies = str(tmp_path / "consistency_methods_no_quies.pdf")
-    analyze.plot_methods_consistency(dict_data, "Method consistency (w=0)", outpath_no_quies, exclude_quiescent=True)
+    analyze.plot_methods_consistency(dict_data, "Method consistency", outpath_no_quies, exclude_quiescent=True)
     assert os.path.exists(outpath_no_quies)
 
     # Test with yscale="log1p"
     outpath_log1p = str(tmp_path / "consistency_methods_log1p.pdf")
-    analyze.plot_methods_consistency(df_all, "Method consistency (w=0)", outpath_log1p, yscale="log1p")
+    analyze.plot_methods_consistency(df_all, "Method consistency", outpath_log1p, yscale="log1p")
     assert os.path.exists(outpath_log1p)
 
     outpath_method_log1p = str(tmp_path / "method_consistency_log1p.pdf")
-    analyze.plot_method_consistency(counts_a, "Method consistency (w=0)", outpath_method_log1p, yscale="log1p")
+    analyze.plot_method_consistency(counts_a, "Method consistency", outpath_method_log1p, yscale="log1p")
     assert os.path.exists(outpath_method_log1p)
+
+    # Test discrete x-axis consistency
+    fractions = (0.0, 0.02, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.98, 1.0)
+    curve_disc = analyze.compute_consistency_curve(counts_a, fractions=fractions)
+    assert len(curve_disc) == len(fractions)
+    assert curve_disc[0][0] == "0%"
+    assert curve_disc[-1][0] == "100%"
+
+    # Test discrete x-axis consistency starting with 25% (e.g. for non-quiescent consistency)
+    fractions_nq = (0.25, 0.5, 0.75, 0.9, 0.95, 0.98, 1.0)
+    curve_disc_nq = analyze.compute_consistency_curve(counts_a, fractions=fractions_nq, exclude_quiescent=True)
+    assert len(curve_disc_nq) == len(fractions_nq)
+    assert curve_disc_nq[0][0] == "25%"
+    assert curve_disc_nq[-1][0] == "100%"
+
+    # Test quiescent fraction consistency
+    # counts_a: 1_TssA: {1: 10, 2: 20}, 2_Quies: {1: 5, 2: 30}
+    # n=1 (0%): shared_all = (20-0) + (30-0) = 50, shared_quies = 30 -> ratio = 30/50 = 0.6
+    # n=2 (100%): shared_all = (20-10) + (30-5) = 10 + 25 = 35, shared_quies = 25 -> ratio = 25/35 = 5/7 ≈ 0.7143
+    curve_q = analyze.compute_quiescent_consistency_curve(counts_a, fractions=fractions)
+    assert len(curve_q) == len(fractions)
+    assert curve_q[0][0] == "0%"
+    assert curve_q[0][2] == pytest.approx(30.0 / 50.0)
+    assert curve_q[-1][0] == "100%"
+    assert curve_q[-1][2] == pytest.approx(25.0 / 35.0)
+
+    outpath_method_q = str(tmp_path / "method_consistency_quies.pdf")
+    analyze.plot_method_consistency(counts_a, "Method consistency Quies", outpath_method_q, quiescent_fraction=True, fractions=fractions)
+    assert os.path.exists(outpath_method_q)
+
+    outpath_methods_q = str(tmp_path / "consistency_methods_quies.pdf")
+    analyze.plot_methods_consistency(dict_data, "Quiescent fraction of shared genome", outpath_methods_q, quiescent_fraction=True, fractions=fractions)
+    assert os.path.exists(outpath_methods_q)
+
+    df_disc_list = []
+    for title, counts, m_key in models:
+        curve = analyze.compute_consistency_curve(counts, fractions=fractions)
+        df_m = pd.DataFrame(curve, columns=["Percent", "SharedBins", "Fraction"])
+        df_m["Model"] = title
+        df_m["Slug"] = m_key
+        df_disc_list.append(df_m)
+    df_disc_all = pd.concat(df_disc_list, ignore_index=True)
+
+    outpath_disc_df = str(tmp_path / "consistency_methods_discrete_df.pdf")
+    analyze.plot_methods_consistency(df_disc_all, "Method consistency (Discrete)", outpath_disc_df, yscale="log1p")
+    assert os.path.exists(outpath_disc_df)
+
+    # Test dataset-specific consistency plots
+    df_disc_all["Dataset"] = "encode"
+    outpath_ds = str(tmp_path / "consistency_methods_encode.pdf")
+    analyze.plot_methods_consistency(df_disc_all[df_disc_all["Dataset"] == "encode"], "Method consistency — ENCODE", outpath_ds, yscale="log1p")
+    assert os.path.exists(outpath_ds)
+
+    outpath_disc_dict = str(tmp_path / "consistency_methods_discrete_dict.pdf")
+    analyze.plot_methods_consistency(dict_data, "Method consistency (Discrete)", outpath_disc_dict, fractions=fractions, yscale="log1p", figsize=(8, 4))
+    assert os.path.exists(outpath_disc_dict)
 
     # Empty inputs
     analyze.plot_methods_consistency([], "Title", str(tmp_path / "empty.pdf"))

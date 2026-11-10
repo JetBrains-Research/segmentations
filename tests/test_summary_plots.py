@@ -395,3 +395,110 @@ def test_method_color_omnipeak_kmeans_consistency():
     assert utils.method_color("joint_chromhmm") == utils.darken_color(utils.BIN_COLORS["default"])
     assert utils.method_color("joint_kmeans_homer") == utils.darken_color(utils.BIN_COLORS["homer"])
     assert utils.method_color("joint_kmeans_macs2") == utils.darken_color(utils.BIN_COLORS["macs2"])
+
+
+def test_plot_replicates_vs_cross_sample_dumbbell(tmp_path):
+    import pandas as pd
+    df_comparisons = pd.DataFrame([
+        {"Dataset": "encode", "Method": "chromhmm_default", "Comparison": "replicates", "Metric": "Kappa", "Value": 0.8},
+        {"Dataset": "encode", "Method": "chromhmm_default", "Comparison": "cross_sample", "Metric": "Kappa", "Value": 0.4},
+        {"Dataset": "encode", "Method": "joint_chromhmm", "Comparison": "replicates", "Metric": "Kappa", "Value": 0.85},
+        {"Dataset": "encode", "Method": "joint_chromhmm", "Comparison": "cross_sample", "Metric": "Kappa", "Value": 0.45},
+        {"Dataset": "sagaconf", "Method": "chromhmm_default", "Comparison": "replicates", "Metric": "Kappa", "Value": 0.75},
+        {"Dataset": "sagaconf", "Method": "chromhmm_default", "Comparison": "cross_sample", "Metric": "Kappa", "Value": 0.35},
+        {"Dataset": "epi1000", "Method": "chromhmm_default", "Comparison": "replicates", "Metric": "Kappa", "Value": 0.55},
+        {"Dataset": "epi1000", "Method": "chromhmm_default", "Comparison": "cross_sample", "Metric": "Kappa", "Value": 0.25},
+    ])
+
+    outpath = str(tmp_path / "agreement_replicates_vs_cross_sample_kappa.pdf")
+    fig, ax = summary_plots.plot_replicates_vs_cross_sample_dumbbell(
+        df_comparisons, metric="Kappa", path=outpath
+    )
+    assert os.path.exists(outpath)
+    assert ax is not None
+    assert len(ax.get_xticks()) == 8
+
+    # Backward compatibility alias test
+    outpath_alias = str(tmp_path / "agreement_replicates_vs_cross_sample_kappa_alias.pdf")
+    fig_alias, ax_alias = summary_plots.plot_replicates_vs_cross_sample_scatter(
+        df_comparisons, metric="Kappa", path=outpath_alias
+    )
+    assert os.path.exists(outpath_alias)
+
+
+def test_plot_state_retention_dumbbell(tmp_path):
+    import pandas as pd
+    import numpy as np
+    import utils
+
+    methods = [
+        utils.CHROMHMM_DEFAULT, utils.JOINT_CHROMHMM,
+        utils.KMEANS_HOMER, utils.JOINT_KMEANS_HOMER,
+        utils.KMEANS_MACS2, utils.JOINT_KMEANS_MACS2,
+        utils.KMEANS_OMNI, utils.JOINT_KMEANS_OMNI
+    ]
+    families = [f for f in utils.STATE_FAMILY_ORDER if f != "Unknown"]
+
+    pw_by_method = {}
+    pb_by_method = {}
+    for m in methods:
+        data_w = np.full((len(families), len(families)), 0.1)
+        np.fill_diagonal(data_w, 0.8)
+        pw_by_method[m] = pd.DataFrame(data_w, index=families, columns=families)
+
+        data_b = np.full((len(families), len(families)), 0.1)
+        np.fill_diagonal(data_b, 0.4)
+        pb_by_method[m] = pd.DataFrame(data_b, index=families, columns=families)
+
+    outpath = str(tmp_path / "state_retention_test.pdf")
+    fig, ax = summary_plots.plot_state_retention_dumbbell(
+        pw_by_method, pb_by_method, path=outpath, title="State retention test"
+    )
+    assert os.path.exists(outpath)
+    assert ax is not None
+    assert len(ax.get_xticks()) == 8
+    assert ax.get_ylabel() == r"State retention probability $P(A \mid A)$"
+    assert ax.get_ylim() == (0.0, 1.05)
+
+
+def test_plot_state_retention_figures_summary_notebook(tmp_path):
+    import json
+    import pandas as pd
+    import numpy as np
+    import utils
+
+    with open("summary.ipynb") as f:
+        nb = json.load(f)
+
+    env = {}
+    for i in [2, 3, 4, 7, 8, 9, 10, 18]:
+        exec("".join(nb["cells"][i]["source"]), env)
+
+    methods = [
+        utils.CHROMHMM_DEFAULT, utils.JOINT_CHROMHMM,
+        utils.KMEANS_HOMER, utils.JOINT_KMEANS_HOMER,
+        utils.KMEANS_MACS2, utils.JOINT_KMEANS_MACS2,
+        utils.KMEANS_OMNI, utils.JOINT_KMEANS_OMNI
+    ]
+    families = [f for f in utils.STATE_FAMILY_ORDER if f != "Unknown"]
+
+    state_switch = {"p_within": {"balanced": {}}, "p_between": {"balanced": {}}}
+    for ds in ["encode", "sagaconf", "epi1000"]:
+        state_switch["p_within"]["balanced"][ds] = {}
+        state_switch["p_between"]["balanced"][ds] = {}
+        for m in methods:
+            data_w = np.full((len(families), len(families)), 0.1)
+            np.fill_diagonal(data_w, 0.75)
+            state_switch["p_within"]["balanced"][ds][m] = pd.DataFrame(data_w, index=families, columns=families)
+
+            data_b = np.full((len(families), len(families)), 0.1)
+            np.fill_diagonal(data_b, 0.35)
+            state_switch["p_between"]["balanced"][ds][m] = pd.DataFrame(data_b, index=families, columns=families)
+
+    written = env["plot_state_retention_figures"](state_switch, str(tmp_path))
+    assert "state_retention_encode.pdf" in written
+    assert "state_retention_sagaconf.pdf" in written
+    assert "state_retention_epi1000.pdf" in written
+    assert os.path.exists(tmp_path / "state_retention_encode.pdf")
+    assert os.path.exists(tmp_path / "state_retention_sagaconf.pdf")
+    assert os.path.exists(tmp_path / "state_retention_epi1000.pdf")

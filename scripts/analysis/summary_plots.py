@@ -22,11 +22,14 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 import seaborn as sns
 
+import matplotlib.lines as mlines
+
 sys.path.insert(0, os.path.dirname(__file__))
 from utils import (METHOD_ORDER, DISPLAY_NAMES, BIN_COLORS, METHOD_INFO,
-                   strip_points, method_color, save_fig, widen_bars,
+                   strip_points, method_color, method_linestyle, save_fig, widen_bars,
                    group_methods, group_xticks,
                    is_joint, is_replicate, JOINT_HATCH,
+                   CHROMHMM_DISPLAY, HOMER_DISPLAY, MACS2_DISPLAY, OMNI_DISPLAY,
                    CHROMHMM_DEFAULT, CHROMHMM_HOMER, CHROMHMM_MACS2, CHROMHMM_OMNI,
                    KMEANS_HOMER, KMEANS_MACS2, KMEANS_OMNI,
                    JOINT_CHROMHMM, JOINT_KMEANS_HOMER, JOINT_KMEANS_MACS2, JOINT_KMEANS_OMNI,
@@ -36,6 +39,7 @@ from utils import (METHOD_ORDER, DISPLAY_NAMES, BIN_COLORS, METHOD_INFO,
                    COSINE_DISPLAY,
                    BAR_STYLE, TITLE_STYLE, AXIS_FONTSIZE, TICK_FONTSIZE, LEGEND_FONTSIZE,
                    LEGEND_TITLE_FONTSIZE, LABEL_FONTSIZE, ANNOTATION_FONTSIZE,
+                   STATE_FAMILY_ORDER, STATE_FAMILY_COLORS, STATE_FAMILY_MARKERS,
                    set_style)
 
 set_style()
@@ -2024,3 +2028,505 @@ def _run_summary_plots(args):
             args.datasets, args.cells, args.workdir, args.nstates,
             INTER_DS_METHODS, args.all_methods_composition_outdir, args.match_method
         )
+
+
+# ---------------------------------------------------------------------------
+# State-switch enrichment plots (Nature Figure 5c)
+# ---------------------------------------------------------------------------
+
+STATE_SWITCH_GRID_CONFIG = [
+    [("Individual", CHROMHMM_DISPLAY, CHROMHMM_DEFAULT),
+     ("Individual", HOMER_DISPLAY, KMEANS_HOMER),
+     ("Individual", MACS2_DISPLAY, KMEANS_MACS2),
+     ("Individual", OMNI_DISPLAY, KMEANS_OMNI)],
+    [("Joint", CHROMHMM_DISPLAY, JOINT_CHROMHMM),
+     ("Joint", HOMER_DISPLAY, JOINT_KMEANS_HOMER),
+     ("Joint", MACS2_DISPLAY, JOINT_KMEANS_MACS2),
+     ("Joint", OMNI_DISPLAY, JOINT_KMEANS_OMNI)],
+]
+
+
+def plot_state_switch_heatmap(enrichment_df, title=None, path=None,
+                              vmin=-1.0, vmax=1.0, cmap="RdBu_r",
+                              annot=True, fmt=".2f", figsize=(7, 6),
+                              xlabel="Destination state family",
+                              ylabel="Source state family"):
+    """Plot a single state-switch enrichment heatmap."""
+    fig, ax = plt.subplots(figsize=figsize)
+    df = enrichment_df.copy()
+
+    sns.heatmap(
+        df,
+        vmin=vmin,
+        vmax=vmax,
+        center=0,
+        cmap=cmap,
+        annot=annot,
+        fmt=fmt,
+        cbar_kws={"label": r"$\log_{10}(P_{\mathrm{between}} / P_{\mathrm{within}})$"},
+        linewidths=0.5,
+        ax=ax
+    )
+    if title:
+        ax.set_title(title, **TITLE_STYLE)
+    ax.set_xlabel(xlabel, fontsize=AXIS_FONTSIZE)
+    ax.set_ylabel(ylabel, fontsize=AXIS_FONTSIZE)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", fontsize=TICK_FONTSIZE)
+    ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=TICK_FONTSIZE)
+    plt.tight_layout()
+    if path:
+        save_fig(fig, path)
+    return fig, ax
+
+
+def plot_state_switch_grid(enrichment_by_config, path=None,
+                           title="Chromatin state-switch enrichment across biological conditions",
+                           vmin=-1.0, vmax=1.0, cmap="RdBu_r", annot=True, fmt=".2f",
+                           figsize=(22, 11)):
+    """Plot the main 2x4 state-switch enrichment grid.
+
+    Arrange:
+    - Rows of panels: Individual and Joint training.
+    - Columns of panels: ChromHMM, HOMER, MACS2, OmniPeak.
+    - Inside each panel: source state family x destination state family.
+
+    Parameters
+    ----------
+    enrichment_by_config : dict
+        Mapping from method key (e.g. 'chromhmm_default', 'joint_kmeans_homer', etc.)
+        or (regime, caller) tuple -> pd.DataFrame or 2D array of enrichment values.
+    path : str, optional
+        File path to save the figure.
+    title : str
+        Super-title for the figure.
+    vmin, vmax : float
+        Color scale limits (symmetric around 0).
+    cmap : str
+        Colormap name.
+    annot : bool
+        Whether to annotate cells with values.
+    fmt : str
+        String formatting for annotations.
+    figsize : tuple
+        Figure size in inches.
+    """
+    n_rows = 2
+    n_cols = 4
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, sharex=True, sharey=True)
+
+    norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
+    sm = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
+
+    for r, row_cfg in enumerate(STATE_SWITCH_GRID_CONFIG):
+        regime_label = "Individual training" if r == 0 else "Joint training"
+        for c, (regime, caller, method_key) in enumerate(row_cfg):
+            ax = axes[r, c]
+
+            df = None
+            if isinstance(enrichment_by_config, dict):
+                if method_key in enrichment_by_config:
+                    df = enrichment_by_config[method_key]
+                elif (regime, caller) in enrichment_by_config:
+                    df = enrichment_by_config[(regime, caller)]
+                elif (r, c) in enrichment_by_config:
+                    df = enrichment_by_config[(r, c)]
+
+            if df is not None and hasattr(df, "shape") and df.shape[0] > 0:
+                sns.heatmap(
+                    df,
+                    vmin=vmin,
+                    vmax=vmax,
+                    center=0,
+                    cmap=cmap,
+                    annot=annot,
+                    fmt=fmt,
+                    annot_kws={"fontsize": 8},
+                    cbar=False,
+                    linewidths=0.5,
+                    linecolor="#ececec",
+                    ax=ax
+                )
+                ax.set_title(f"{caller} ({regime.lower()})", fontsize=LABEL_FONTSIZE, fontweight="bold", pad=8)
+            else:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+                ax.set_title(f"{caller} ({regime.lower()})", fontsize=LABEL_FONTSIZE, fontweight="bold", pad=8)
+
+            if c == 0:
+                ax.set_ylabel(f"{regime_label}\n\nSource state family", fontsize=AXIS_FONTSIZE)
+            else:
+                ax.set_ylabel("")
+
+            if r == n_rows - 1:
+                ax.set_xlabel("Destination state family", fontsize=AXIS_FONTSIZE)
+                ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", fontsize=TICK_FONTSIZE)
+            else:
+                ax.set_xlabel("")
+
+            ax.tick_params(axis="y", labelsize=TICK_FONTSIZE)
+
+    plt.subplots_adjust(top=0.90, bottom=0.12, left=0.07, right=0.91, hspace=0.25, wspace=0.15)
+
+    if title:
+        fig.suptitle(title, fontsize=TITLE_STYLE.get("fontsize", 14), fontweight="bold", y=0.97)
+
+    cbar_ax = fig.add_axes([0.93, 0.18, 0.015, 0.68])
+    cbar = fig.colorbar(sm, cax=cbar_ax)
+    cbar.set_label(r"State-switch enrichment  $\log_{10}(P_{\mathrm{between}} / P_{\mathrm{within}})$",
+                   fontsize=AXIS_FONTSIZE)
+    cbar.ax.tick_params(labelsize=TICK_FONTSIZE)
+
+    if path:
+        save_fig(fig, path, tight=False, bar_width=False)
+
+    return fig, axes
+
+
+def plot_state_switch_datasets(enrichments_by_dataset, method_label="ChromHMM default",
+                               path=None, title=None,
+                               vmin=-1.0, vmax=1.0, cmap="RdBu_r", annot=True, fmt=".2f",
+                               figsize=None):
+    """Plot state-switch enrichment heatmaps for a specific method across datasets side by side.
+
+    Parameters
+    ----------
+    enrichments_by_dataset : dict
+        Mapping from dataset name/label (e.g. 'ENCODE', 'SAGAconf', '1000 epigenomes', 'Aggregated') -> pd.DataFrame.
+    method_label : str
+        Method display name for the title.
+    path : str, optional
+        File path to save the figure.
+    title : str, optional
+        Super-title for the figure.
+    vmin, vmax : float
+        Color scale limits.
+    cmap : str
+        Colormap name.
+    annot : bool
+        Whether to annotate cells with values.
+    fmt : str
+        Annotation formatting string.
+    figsize : tuple, optional
+        Figure size in inches.
+    """
+    n_datasets = len(enrichments_by_dataset)
+    if figsize is None:
+        figsize = (5.5 * n_datasets + 1.5, 5.5)
+
+    fig, axes = plt.subplots(1, n_datasets, figsize=figsize, sharey=True)
+    if n_datasets == 1:
+        axes = [axes]
+
+    norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
+    sm = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
+
+    for i, (ds_name, df) in enumerate(enrichments_by_dataset.items()):
+        ax = axes[i]
+        if df is not None and hasattr(df, "shape") and df.shape[0] > 0:
+            sns.heatmap(
+                df,
+                vmin=vmin,
+                vmax=vmax,
+                center=0,
+                cmap=cmap,
+                annot=annot,
+                fmt=fmt,
+                annot_kws={"fontsize": 8},
+                cbar=False,
+                linewidths=0.5,
+                linecolor="#ececec",
+                ax=ax
+            )
+        else:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+
+        ax.set_title(ds_name, fontsize=LABEL_FONTSIZE, fontweight="bold", pad=8)
+        ax.set_xlabel("Destination state family", fontsize=AXIS_FONTSIZE)
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", fontsize=TICK_FONTSIZE)
+
+        if i == 0:
+            ax.set_ylabel("Source state family", fontsize=AXIS_FONTSIZE)
+        else:
+            ax.set_ylabel("")
+
+        ax.tick_params(axis="y", labelsize=TICK_FONTSIZE)
+
+    plt.subplots_adjust(top=0.85, bottom=0.20, left=0.06, right=0.90, wspace=0.15)
+
+    if title is None:
+        title = f"{method_label} chromatin state-switch enrichment across datasets"
+    fig.suptitle(title, fontsize=TITLE_STYLE.get("fontsize", 14), fontweight="bold", y=0.96)
+
+    cbar_ax = fig.add_axes([0.92, 0.22, 0.015, 0.60])
+    cbar = fig.colorbar(sm, cax=cbar_ax)
+    cbar.set_label(r"State-switch enrichment  $\log_{10}(P_{\mathrm{between}} / P_{\mathrm{within}})$",
+                   fontsize=AXIS_FONTSIZE)
+    cbar.ax.tick_params(labelsize=TICK_FONTSIZE)
+
+    if path:
+        save_fig(fig, path, tight=False, bar_width=False)
+
+    return fig, axes
+
+
+def plot_replicates_vs_cross_sample_dumbbell(comparisons, metric="Kappa", path=None, methods=None,
+                                             title=None, figsize=(8.5, 5.0),
+                                             dataset_symbols=None, **kwargs):
+    """Connected paired point-range (dumbbell) plot of within-condition replicate agreement vs between-condition cross-sample agreement.
+
+    For each method on the x-axis, displays the 3 datasets side-by-side using distinct marker symbols
+    (circle for ENCODE, square for SAGAconf, triangle for 1000 epigenomes). Replicate agreement (within-condition)
+    is shown as filled markers and cross-sample agreement (between-condition) as open markers, connected by a
+    vertical stem colored by method.
+
+    Parameters
+    ----------
+    comparisons : pd.DataFrame
+        DataFrame with columns ['Dataset', 'Method', 'Comparison', 'Metric', 'Value'].
+    metric : str
+        Metric to display (e.g. 'Kappa', 'AMI', 'Jaccard', 'Composition'). Defaults to 'Kappa'.
+    path : str, optional
+        Path to save the output PDF figure.
+    methods : list, optional
+        List of method keys to include. Defaults to the 8 standard methods (Individual and Joint).
+    title : str, optional
+        Title for the figure.
+    figsize : tuple, optional
+        Figure size in inches. Defaults to (8.5, 5.0).
+    dataset_symbols : dict, optional
+        Mapping from dataset key to (marker, display_name).
+    """
+    if dataset_symbols is None:
+        dataset_symbols = kwargs.get("dataset_markers", kwargs.get("dataset_names", None))
+
+    if dataset_symbols is None:
+        dataset_symbols = {
+            "encode": ("o", "ENCODE"),
+            "sagaconf": ("s", "SAGAconf"),
+            "epi1000": ("^", "1000 epigenomes")
+        }
+    else:
+        norm_symbols = {}
+        default_markers = {"encode": "o", "sagaconf": "s", "epi1000": "^"}
+        for k, v in dataset_symbols.items():
+            if isinstance(v, tuple) and len(v) == 2:
+                norm_symbols[k] = v
+            else:
+                norm_symbols[k] = (default_markers.get(k, "o"), str(v))
+        dataset_symbols = norm_symbols
+
+    if methods is None:
+        methods = [
+            CHROMHMM_DEFAULT, JOINT_CHROMHMM,
+            KMEANS_HOMER, JOINT_KMEANS_HOMER,
+            KMEANS_MACS2, JOINT_KMEANS_MACS2,
+            KMEANS_OMNI, JOINT_KMEANS_OMNI
+        ]
+
+    # Filter comparisons for the chosen metric and comparisons
+    sub = comparisons[
+        (comparisons["Metric"].astype(str).str.lower() == str(metric).lower())
+        & comparisons["Comparison"].isin(["replicates", "cross_sample"])
+        & comparisons["Method"].isin(methods)
+    ]
+
+    if sub.empty:
+        print(f"  no comparison data for metric {metric}")
+        return None, None
+
+    means = sub.groupby(["Dataset", "Method", "Comparison"], observed=False)["Value"].mean().unstack(level="Comparison")
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    xs = np.arange(len(methods))
+    ds_keys = list(dataset_symbols.keys())
+    n_ds = len(ds_keys)
+    width = 0.44
+    offsets = np.linspace(-width / 2, width / 2, n_ds) if n_ds > 1 else [0.0]
+
+    for i_m, m in enumerate(methods):
+        c = method_color(m)
+        for i_ds, ds in enumerate(ds_keys):
+            marker, ds_name = dataset_symbols[ds]
+            x = xs[i_m] + offsets[i_ds]
+
+            if (ds, m) in means.index:
+                y_repl = means.loc[(ds, m), "replicates"] if "replicates" in means.columns else np.nan
+                y_cross = means.loc[(ds, m), "cross_sample"] if "cross_sample" in means.columns else np.nan
+
+                if pd.notna(y_repl) and pd.notna(y_cross):
+                    # Vertical stem connecting cross-sample floor to replicate ceiling
+                    ax.plot([x, x], [y_cross, y_repl], color=c, linestyle="-", linewidth=2.0, alpha=0.85, zorder=2)
+                    # Replicates (solid)
+                    ax.scatter(x, y_repl, marker=marker, s=65, facecolor=c, edgecolor="black", linewidth=0.8, zorder=4)
+                    # Cross-sample (open)
+                    ax.scatter(x, y_cross, marker=marker, s=65, facecolor="white", edgecolor=c, linewidth=1.8, zorder=4)
+                elif pd.notna(y_repl):
+                    ax.scatter(x, y_repl, marker=marker, s=65, facecolor=c, edgecolor="black", linewidth=0.8, zorder=4)
+
+    ax.set_xticks(xs)
+    ax.set_xticklabels([display_name(m) for m in methods], rotation=45, ha="right", fontsize=TICK_FONTSIZE)
+
+    metric_sym = r"\kappa" if str(metric).lower() == "kappa" else metric
+    metric_display_name = r"Cohen's $\kappa$" if str(metric).lower() == "kappa" else str(metric)
+    ax.set_ylabel(f"{metric_display_name} agreement index", fontsize=AXIS_FONTSIZE)
+    ax.set_ylim(0.0, 0.90)
+    ax.grid(True, axis="y", linestyle="--", alpha=0.3)
+    ax.tick_params(axis="both", labelsize=TICK_FONTSIZE)
+
+    # Legend 1: Datasets (symbols)
+    dataset_handles = [
+        mlines.Line2D([], [], color="none", marker=marker, markersize=8,
+                      markerfacecolor="#666666", markeredgecolor="black", markeredgewidth=0.8,
+                      label=label)
+        for ds, (marker, label) in dataset_symbols.items()
+    ]
+
+    # Legend 2: Agreement Comparison (solid vs open)
+    comparison_handles = [
+        mlines.Line2D([], [], color="black", marker="o", markersize=7, markerfacecolor="black",
+                      linestyle="none", label="Replicates (within-condition)"),
+        mlines.Line2D([], [], color="black", marker="o", markersize=7, markerfacecolor="white",
+                      markeredgewidth=1.8, linestyle="none", label="Cross-sample (between-condition)")
+    ]
+
+    leg1 = ax.legend(handles=dataset_handles, title="Datasets", fontsize=LEGEND_FONTSIZE,
+                     title_fontsize=LEGEND_TITLE_FONTSIZE, loc="upper left", bbox_to_anchor=(1.02, 1.0),
+                     frameon=True, edgecolor="#cccccc")
+    ax.add_artist(leg1)
+
+    ax.legend(handles=comparison_handles, title="Comparison", fontsize=LEGEND_FONTSIZE,
+              title_fontsize=LEGEND_TITLE_FONTSIZE, loc="upper left", bbox_to_anchor=(1.02, 0.65),
+              frameon=True, edgecolor="#cccccc")
+
+    if title is None:
+        title = f"Replicate vs. cross-sample agreement ({metric_display_name})"
+    ax.set_title(title, **TITLE_STYLE)
+
+    plt.subplots_adjust(top=0.90, bottom=0.25, left=0.08, right=0.72)
+
+    if path:
+        save_fig(fig, path, tight=False, bar_width=False)
+
+    return fig, ax
+
+
+# Alias for backward compatibility
+plot_replicates_vs_cross_sample_scatter = plot_replicates_vs_cross_sample_dumbbell
+
+
+def plot_state_retention_dumbbell(p_within_by_method, p_between_by_method,
+                                  path=None, title=None, figsize=(10.0, 5.2),
+                                  methods=None, families=None,
+                                  family_colors=None, family_markers=None,
+                                  **kwargs):
+    """Connected paired point-range (dumbbell) plot of within-condition state retention vs between-condition state retention.
+
+    For each method on the x-axis, displays the chromatin state families side-by-side using distinct colors and markers.
+    Within-condition state retention P_within(A|A) is shown as filled markers and between-condition state retention
+    P_between(A|A) as open markers, connected by a vertical stem colored by state family.
+
+    Parameters
+    ----------
+    p_within_by_method : dict
+        Mapping from method key -> DataFrame of within-condition transition probabilities (source x destination).
+    p_between_by_method : dict
+        Mapping from method key -> DataFrame of between-condition transition probabilities (source x destination).
+    path : str, optional
+        Path to save the output PDF figure.
+    title : str, optional
+        Title for the figure.
+    figsize : tuple, optional
+        Figure size in inches. Defaults to (10.0, 5.2).
+    methods : list, optional
+        List of method keys to include. Defaults to the 8 standard methods.
+    families : list, optional
+        List of state family names. Defaults to STATE_FAMILY_ORDER.
+    family_colors : dict, optional
+        Mapping from state family name -> hex color. Defaults to STATE_FAMILY_COLORS.
+    family_markers : dict, optional
+        Mapping from state family name -> marker symbol. Defaults to STATE_FAMILY_MARKERS.
+    """
+    if methods is None:
+        methods = [
+            CHROMHMM_DEFAULT, JOINT_CHROMHMM,
+            KMEANS_HOMER, JOINT_KMEANS_HOMER,
+            KMEANS_MACS2, JOINT_KMEANS_MACS2,
+            KMEANS_OMNI, JOINT_KMEANS_OMNI
+        ]
+
+    if families is None:
+        families = [f for f in STATE_FAMILY_ORDER if f != "Unknown"]
+
+    if family_colors is None:
+        family_colors = STATE_FAMILY_COLORS
+
+    if family_markers is None:
+        family_markers = STATE_FAMILY_MARKERS
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    xs = np.arange(len(methods))
+    n_f = len(families)
+    width = 0.58
+    offsets = np.linspace(-width / 2, width / 2, n_f) if n_f > 1 else [0.0]
+
+    for i_m, m in enumerate(methods):
+        df_w = p_within_by_method.get(m)
+        df_b = p_between_by_method.get(m)
+        if df_w is None or df_b is None:
+            continue
+        for i_f, f in enumerate(families):
+            x = xs[i_m] + offsets[i_f]
+            c = family_colors.get(f, "#666666")
+            marker = family_markers.get(f, "o")
+
+            y_w = df_w.loc[f, f] if (f in df_w.index and f in df_w.columns) else np.nan
+            y_b = df_b.loc[f, f] if (f in df_b.index and f in df_b.columns) else np.nan
+
+            if pd.notna(y_w) and pd.notna(y_b):
+                ax.plot([x, x], [y_b, y_w], color=c, linestyle="-", linewidth=2.0, alpha=0.85, zorder=2)
+                ax.scatter(x, y_w, marker=marker, s=60, facecolor=c, edgecolor="black", linewidth=0.8, zorder=4)
+                ax.scatter(x, y_b, marker=marker, s=60, facecolor="white", edgecolor=c, linewidth=1.8, zorder=4)
+            elif pd.notna(y_w):
+                ax.scatter(x, y_w, marker=marker, s=60, facecolor=c, edgecolor="black", linewidth=0.8, zorder=4)
+
+    ax.set_xticks(xs)
+    ax.set_xticklabels([display_name(m) for m in methods], rotation=45, ha="right", fontsize=TICK_FONTSIZE)
+    ax.set_ylabel(r"State retention probability $P(A \mid A)$", fontsize=AXIS_FONTSIZE)
+    ax.set_ylim(0.0, 1.05)
+    ax.grid(True, axis="y", linestyle="--", alpha=0.3)
+    ax.tick_params(axis="both", labelsize=TICK_FONTSIZE)
+
+    family_handles = [
+        mlines.Line2D([], [], color="none", marker=family_markers.get(f, "o"), markersize=8,
+                      markerfacecolor=family_colors.get(f, "#666666"), markeredgecolor="black", markeredgewidth=0.8,
+                      label=f)
+        for f in families
+    ]
+    retention_handles = [
+        mlines.Line2D([], [], color="black", marker="o", markersize=7, markerfacecolor="black",
+                      linestyle="none", label=r"Within-condition $P_{\mathrm{within}}(A\mid A)$"),
+        mlines.Line2D([], [], color="black", marker="o", markersize=7, markerfacecolor="white",
+                      markeredgewidth=1.8, linestyle="none", label=r"Between-condition $P_{\mathrm{between}}(A\mid A)$")
+    ]
+
+    leg1 = ax.legend(handles=family_handles, title="State families", fontsize=LEGEND_FONTSIZE,
+                     title_fontsize=LEGEND_TITLE_FONTSIZE, loc="upper left", bbox_to_anchor=(1.02, 1.0),
+                     frameon=True, edgecolor="#cccccc")
+    ax.add_artist(leg1)
+
+    ax.legend(handles=retention_handles, title="State retention", fontsize=LEGEND_FONTSIZE,
+              title_fontsize=LEGEND_TITLE_FONTSIZE, loc="upper left", bbox_to_anchor=(1.02, 0.42),
+              frameon=True, edgecolor="#cccccc")
+
+    if title is None:
+        title = r"Chromatin state retention within vs. between conditions"
+    ax.set_title(title, **TITLE_STYLE)
+
+    plt.subplots_adjust(top=0.90, bottom=0.25, left=0.08, right=0.70)
+
+    if path:
+        save_fig(fig, path, tight=False, bar_width=False)
+
+    return fig, ax
