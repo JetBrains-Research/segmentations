@@ -28,6 +28,15 @@ ref_bed() {
  esac
 }
 
+# Cell type name of a dataset
+cell_name() {
+ case "$1" in
+  imr90) echo "IMR90" ;;
+  monocytes) echo "Monocyte" ;;
+  spleen) echo "Spleen" ;;
+ esac
+}
+
 
 # 1. Joint KMeans replicates states processing
 for ds in imr90 monocytes spleen
@@ -98,4 +107,52 @@ do
  echo "Matching $ds joint ChromHMM to the ENCODE reference"
  match_joint "$(ref_bed "$ds")" "joint_chromhmm/rep1_${STATES}_dense.bed" \
  "joint_chromhmm/rep2_${STATES}_dense.bed" "chromhmm" "$CHROMHMM_BIN"
+done
+
+# 5. ChromHMM over peaks processing
+for ds in imr90 monocytes spleen
+do
+ echo "===================="; echo "$ds"
+ cd "$DIR/$ds" || exit
+ CELL=$(cell_name "$ds")
+ for PC in homer macs2 omni
+ do
+  echo "~~~~~~~~~~~~~~~~~~~~"; echo "ChromHMM over peaks: $PC"
+  TMP_DIR=$(mktemp -d)
+  TABLE="$TMP_DIR/table.txt"
+  CS="$TMP_DIR/chromsizes.txt"
+  grep -v "_" "$CHROMSIZES" > "$CS"
+  > "$TABLE"
+  for M in H3K4me3 H3K27ac H3K4me1 H3K36me3 H3K9me3 H3K27me3
+  do
+   case "$PC" in
+    omni)  P="${M}.peak" ;;
+    homer) P="${M}.bed" ;;
+    macs2) P="${M}.bed" ;;
+   esac
+   if [[ -f "$PC/$P" ]]; then
+     echo -e "${CELL}\t${M}\t${P}" >> "$TABLE"
+   fi
+  done
+
+  java -mx4000M -jar "$CHROMHMM_JAR" BinarizeBed -peaks -b "$PEAKS_BIN" "$CS" "$PC" "$TABLE" "$TMP_DIR/binary"
+  java -mx4000M -jar "$CHROMHMM_JAR" LearnModel -p 8 -b "$PEAKS_BIN" "$TMP_DIR/binary" "$TMP_DIR/model" "$STATES" "$GENOME"
+
+  cp "$TMP_DIR/model/${CELL}_${STATES}_dense.bed" "$PC/${PC}_chromhmm_states.bed" 2>/dev/null || \
+  cp "$TMP_DIR/model/${STATES}_dense.bed" "$PC/${PC}_chromhmm_states.bed"
+
+  rm -rf "$TMP_DIR"
+ done
+done
+
+# 6. Match ChromHMM over peaks to the ENCODE reference
+for ds in imr90 monocytes spleen
+do
+ echo "===================="; echo "$ds"
+ cd "$DIR/$ds" || exit
+ for PC in homer macs2 omni
+ do
+  echo "Matching $ds $PC ChromHMM over peaks to the ENCODE reference"
+  match_states "$(ref_bed "$ds")" "$PC/${PC}_chromhmm_states.bed" "$PC" "$PEAKS_BIN" "."
+ done
 done
