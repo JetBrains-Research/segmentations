@@ -1664,7 +1664,7 @@ def compute_state_switch_enrichment(within_matrix, between_matrix, pseudocount=0
 
 
 # -----------------------------------------------------------------------------
-# Distance to TSS discordance curves (Layout 1: 4-Panel Grid by Method)
+# Distance to TSS agreement curves (Layout 1: 4-Panel Grid by Method)
 # -----------------------------------------------------------------------------
 
 DISTANCE_TSS_BINS = (0, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000, np.inf)
@@ -1781,37 +1781,79 @@ def load_bed_codes(bed_path, chrom_sizes, bin_size=200, state_map=None):
     return codes
 
 
-def compute_distance_tss_discordance(codes_a, codes_b, dist_tiers, n_tiers=len(DISTANCE_TSS_LABELS)):
-    """Compute state discordance (mismatch rate) per distance tier between two segmentations."""
-    tier_mismatches = np.zeros(n_tiers, dtype=np.int64)
+def _distance_tss_counts(codes_a, codes_b, dist_tiers, n_tiers, target_codes, family_match):
+    """Per-tier (matches, totals) of bins compared between two segmentations.
+
+    Without ``target_codes`` every bin called in both segmentations is compared
+    and a match means the same state. With ``target_codes`` only bins where at
+    least one segmentation calls a target state are compared; when
+    ``family_match`` is set a match means both call some target state (the
+    family), otherwise both must call the identical state.
+    """
+    tier_matches = np.zeros(n_tiers, dtype=np.int64)
     tier_totals = np.zeros(n_tiers, dtype=np.int64)
+    target_set = list(target_codes) if target_codes is not None else None
 
     for chrom, tier in dist_tiers.items():
         if chrom in codes_a and chrom in codes_b:
             ca = codes_a[chrom]
             cb = codes_b[chrom]
             min_len = min(len(ca), len(cb), len(tier))
-            valid = (ca[:min_len] >= 0) & (cb[:min_len] >= 0)
-            mismatch = valid & (ca[:min_len] != cb[:min_len])
+            ca_s = ca[:min_len]
+            cb_s = cb[:min_len]
+            valid = (ca_s >= 0) & (cb_s >= 0)
+            if target_set is not None:
+                in_a = np.isin(ca_s, target_set)
+                in_b = np.isin(cb_s, target_set)
+                valid &= in_a | in_b
+                match = valid & ((in_a & in_b) if family_match else (ca_s == cb_s))
+            else:
+                match = valid & (ca_s == cb_s)
 
             t = tier[:min_len]
             tier_totals += np.bincount(t[valid], minlength=n_tiers)
-            tier_mismatches += np.bincount(t[mismatch], minlength=n_tiers)
+            tier_matches += np.bincount(t[match], minlength=n_tiers)
+    return tier_matches, tier_totals
 
+
+def compute_distance_tss_agreement(codes_a, codes_b, dist_tiers, n_tiers=len(DISTANCE_TSS_LABELS),
+                                   target_codes=None, family_match=True):
+    """Compute state agreement (match rate) per distance tier between two segmentations.
+
+    With ``target_codes`` (the states of one family) the rate is family-level
+    agreement: bins where both segmentations call a family state over bins
+    where either does. Pass ``family_match=False`` to require the identical
+    state instead. Tiers with no compared bins get 0.
+    """
+    matches, totals = _distance_tss_counts(codes_a, codes_b, dist_tiers, n_tiers,
+                                           target_codes, family_match)
     rates = np.zeros(n_tiers, dtype=np.float64)
-    nz = tier_totals > 0
-    rates[nz] = tier_mismatches[nz] / tier_totals[nz]
+    nz = totals > 0
+    rates[nz] = matches[nz] / totals[nz]
     return rates
 
 
-def plot_distance_tss_discordance_grid(df_results, title="State discordance vs. Distance to TSS",
-                                       out_path=None, distance_labels=DISTANCE_TSS_LABELS,
-                                       layout=(1, 4), figsize=(15, 3.8)):
+def compute_distance_tss_discordance(codes_a, codes_b, dist_tiers, n_tiers=len(DISTANCE_TSS_LABELS),
+                                     target_codes=None, family_match=True):
+    """Compute state discordance (mismatch rate) per distance tier, the
+    complement of :func:`compute_distance_tss_agreement`. Tiers with no
+    compared bins get 0."""
+    matches, totals = _distance_tss_counts(codes_a, codes_b, dist_tiers, n_tiers,
+                                           target_codes, family_match)
+    rates = np.zeros(n_tiers, dtype=np.float64)
+    nz = totals > 0
+    rates[nz] = (totals[nz] - matches[nz]) / totals[nz]
+    return rates
+
+
+def plot_distance_tss_agreement_grid(df_results, title="State agreement vs. Distance to TSS",
+                                     out_path=None, distance_labels=DISTANCE_TSS_LABELS,
+                                     layout=(1, 4), figsize=(15, 3.8), ylim=None):
     """Plot Layout 1: 4-Panel Grid by Method (Method-Centric View).
 
     Creates a 1x4 grid (or custom layout) where each panel represents one caller
     (ChromHMM, Homer KMeans, MACS2 KMeans, OmniPeak KMeans) and compares Individual
-    vs Joint and Replicate vs Between-sample discordance curves as a function of
+    vs Joint and Replicate vs Between-sample agreement curves as a function of
     distance to nearest TSS.
     """
     panels = [
@@ -1825,6 +1867,21 @@ def plot_distance_tss_discordance_grid(df_results, title="State discordance vs. 
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize, sharex=True, sharey=True, squeeze=False)
     x = np.arange(len(distance_labels))
 
+    if isinstance(df_results, pd.DataFrame) and "Group" in df_results.columns:
+        if "All" in df_results["Group"].values and len(df_results["Group"].unique()) > 1:
+            df_results = df_results[df_results["Group"] == "All"]
+
+    if ylim is None:
+        if isinstance(df_results, pd.DataFrame) and not df_results.empty:
+            val_col = "Agreement" if "Agreement" in df_results.columns else "Discordance"
+            max_val = df_results[val_col].max()
+            if pd.notna(max_val) and max_val > 1.0:
+                ylim = (0, float(max_val) + 0.05)
+            else:
+                ylim = (0, 1.05)
+        else:
+            ylim = (0, 1.05)
+
     for idx, (panel_title, ind_key, jnt_key) in enumerate(panels):
         r = idx // ncols
         c = idx % ncols
@@ -1833,40 +1890,52 @@ def plot_distance_tss_discordance_grid(df_results, title="State discordance vs. 
         c_jnt = utils.method_color(jnt_key)
 
         if isinstance(df_results, pd.DataFrame):
+            val_col = "Agreement" if "Agreement" in df_results.columns else "Discordance"
             df_ind_b = df_results[(df_results["Method"] == ind_key) & (df_results["Type"].isin(["Between", "Between-sample"]))]
             df_ind_r = df_results[(df_results["Method"] == ind_key) & (df_results["Type"].isin(["Replicate", "Within-replicate"]))]
             df_jnt_b = df_results[(df_results["Method"] == jnt_key) & (df_results["Type"].isin(["Between", "Between-sample"]))]
             df_jnt_r = df_results[(df_results["Method"] == jnt_key) & (df_results["Type"].isin(["Replicate", "Within-replicate"]))]
 
-            ind_b = df_ind_b["Discordance"].values if not df_ind_b.empty else np.zeros(len(x))
-            ind_r = df_ind_r["Discordance"].values if not df_ind_r.empty else np.zeros(len(x))
-            jnt_b = df_jnt_b["Discordance"].values if not df_jnt_b.empty else np.zeros(len(x))
-            jnt_r = df_jnt_r["Discordance"].values if not df_jnt_r.empty else np.zeros(len(x))
-        elif isinstance(df_results, dict):
-            ind_b = df_results.get((ind_key, "Between"), np.zeros(len(x)))
-            ind_r = df_results.get((ind_key, "Replicate"), np.zeros(len(x)))
-            jnt_b = df_results.get((jnt_key, "Between"), np.zeros(len(x)))
-            jnt_r = df_results.get((jnt_key, "Replicate"), np.zeros(len(x)))
-        else:
-            ind_b, ind_r, jnt_b, jnt_r = np.zeros(len(x)), np.zeros(len(x)), np.zeros(len(x)), np.zeros(len(x))
+            def _curve(d):
+                # Align on the distance label rather than row order; several
+                # rows per label (e.g. more than one dataset) are averaged.
+                if d.empty:
+                    return None
+                if "Distance" not in d.columns:
+                    return d[val_col].values
+                return (d.groupby("Distance", sort=False)[val_col].mean()
+                        .reindex(list(distance_labels)).values)
 
-        if len(ind_b) == len(x) and np.any(ind_b > 0):
+            ind_b = _curve(df_ind_b)
+            ind_r = _curve(df_ind_r)
+            jnt_b = _curve(df_jnt_b)
+            jnt_r = _curve(df_jnt_r)
+        elif isinstance(df_results, dict):
+            ind_b = df_results.get((ind_key, "Between"), None)
+            ind_r = df_results.get((ind_key, "Replicate"), None)
+            jnt_b = df_results.get((jnt_key, "Between"), None)
+            jnt_r = df_results.get((jnt_key, "Replicate"), None)
+        else:
+            ind_b, ind_r, jnt_b, jnt_r = None, None, None, None
+
+        if ind_b is not None and len(ind_b) == len(x):
             ax.plot(x, ind_b, color=c_ind, lw=2.0, marker="o", markersize=4)
-        if len(ind_r) == len(x) and np.any(ind_r > 0):
+        if ind_r is not None and len(ind_r) == len(x):
             ax.plot(x, ind_r, color=c_ind, lw=1.5, ls="--", marker=".", markersize=4, alpha=0.7)
-        if len(jnt_b) == len(x) and np.any(jnt_b > 0):
+        if jnt_b is not None and len(jnt_b) == len(x):
             ax.plot(x, jnt_b, color=c_jnt, lw=2.0, ls="-.", marker="s", markersize=4)
-        if len(jnt_r) == len(x) and np.any(jnt_r > 0):
+        if jnt_r is not None and len(jnt_r) == len(x):
             ax.plot(x, jnt_r, color=c_jnt, lw=1.5, ls=":", marker="x", markersize=4, alpha=0.7)
 
         ax.set_title(panel_title, fontsize=11, fontweight="bold")
         ax.set_xticks(x)
         ax.set_xticklabels(distance_labels, rotation=45, ha="right", fontsize=9)
         ax.grid(True, linestyle=":", alpha=0.6)
-        ax.set_ylim(0, 0.7)
+        ax.set_ylim(ylim[0], ylim[1])
 
         if c == 0:
-            ax.set_ylabel("State Discordance Rate", fontsize=10)
+            ylabel = "State Agreement Rate" if (not isinstance(df_results, pd.DataFrame) or "Agreement" in df_results.columns or "Discordance" not in df_results.columns) else "State Discordance Rate"
+            ax.set_ylabel(ylabel, fontsize=10)
         else:
             ax.set_ylabel("")
 
@@ -1888,6 +1957,155 @@ def plot_distance_tss_discordance_grid(df_results, title="State discordance vs. 
     if title:
         fig.suptitle(title, fontsize=12, fontweight="bold", y=1.005 if nrows > 1 else 1.02)
 
+    plt.tight_layout()
+    if out_path:
+        save_fig(fig, out_path)
+    return fig
+
+
+plot_distance_tss_discordance_grid = plot_distance_tss_agreement_grid
+
+
+def compute_distance_tss_agreement_ratio(df_results, value_col="Agreement"):
+    """Ratio of between-sample to replicate agreement per distance tier.
+
+    Takes the long table of :func:`plot_distance_tss_agreement_grid` (columns
+    Method, Type, Distance, ``value_col`` and optionally Dataset / Group) and
+    returns one row per (keys, Distance) with Between, Replicate,
+    Ratio = Between / Replicate and Log10Ratio = log10(Ratio). A ratio near 1
+    (log10 near 0) means agreement across conditions is as high as across
+    replicates; tiers with zero replicate or between agreement get NaN.
+    """
+    df = df_results.copy()
+    df["Type"] = df["Type"].replace({"Between-sample": "Between", "Within-replicate": "Replicate"})
+    keys = [k for k in ("Dataset", "Group", "Method") if k in df.columns] + ["Distance"]
+    wide = df.pivot_table(index=keys, columns="Type", values=value_col, aggfunc="mean", sort=False)
+    for col in ("Between", "Replicate"):
+        if col not in wide.columns:
+            wide[col] = np.nan
+    wide = wide[["Between", "Replicate"]]
+    wide["Ratio"] = wide["Between"] / wide["Replicate"].where(wide["Replicate"] > 0)
+    wide["Log10Ratio"] = np.log10(wide["Ratio"].where(wide["Ratio"] > 0))
+    wide.columns.name = None
+    return wide.reset_index()
+
+
+DISTANCE_TSS_RATIO_METHODS = (
+    utils.CHROMHMM_DEFAULT, utils.JOINT_CHROMHMM,
+    utils.KMEANS_HOMER, utils.JOINT_KMEANS_HOMER,
+    utils.KMEANS_MACS2, utils.JOINT_KMEANS_MACS2,
+    utils.KMEANS_OMNI, utils.JOINT_KMEANS_OMNI,
+)
+_DISTANCE_TSS_JOINT = {utils.JOINT_CHROMHMM, utils.JOINT_KMEANS_HOMER,
+                       utils.JOINT_KMEANS_MACS2, utils.JOINT_KMEANS_OMNI}
+
+
+def _distance_tss_log10_ylim(values):
+    vals = pd.Series(values).replace([np.inf, -np.inf], np.nan).dropna()
+    lo = min(-0.1, float(vals.min())) if not vals.empty else -1.0
+    hi = max(0.05, float(vals.max())) if not vals.empty else 0.05
+    pad = 0.05 * (hi - lo)
+    return lo - pad, hi + pad
+
+
+def _distance_tss_ratio_methods(models=None):
+    """Ratio-plot methods, optionally only "individual" or "joint" models."""
+    if models is None:
+        return DISTANCE_TSS_RATIO_METHODS
+    if models not in ("individual", "joint"):
+        raise ValueError(f"models must be None, 'individual' or 'joint', got {models!r}")
+    want_joint = models == "joint"
+    return tuple(m for m in DISTANCE_TSS_RATIO_METHODS if (m in _DISTANCE_TSS_JOINT) == want_joint)
+
+
+def _draw_distance_tss_ratio(ax, df, labels, methods=DISTANCE_TSS_RATIO_METHODS):
+    """Draw one log10 ratio curve per method on ``ax``, coloured by method:
+    Individual solid with circles, Joint dash-dot with squares."""
+    x = np.arange(len(labels))
+    ax.axhline(0.0, color="black", lw=0.8, alpha=0.5)
+    for m in methods:
+        d = df[df["Method"] == m]
+        if d.empty:
+            continue
+        y = d.groupby("Distance", sort=False)["Log10Ratio"].mean().reindex(labels).values
+        is_joint = m in _DISTANCE_TSS_JOINT
+        ax.plot(x, y, color=utils.method_color(m), lw=2.0,
+                ls="-." if is_joint else "-", marker="s" if is_joint else "o", markersize=4,
+                label=utils.display_name(m))
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=9)
+    ax.grid(True, linestyle=":", alpha=0.6)
+    ax.set_xlabel("Distance to Nearest TSS", fontsize=10)
+
+
+def plot_distance_tss_agreement_ratio_grid(df_results, title="log10 Between-sample / replicate agreement vs. Distance to TSS",
+                                           out_path=None, distance_labels=DISTANCE_TSS_LABELS,
+                                           figsize=(8, 4.5), ylim=None):
+    """Plot log10 of the between-sample / replicate agreement ratio by distance to TSS.
+
+    A single panel with one curve per method, coloured by method: Individual
+    models solid with circles, Joint models dash-dot with squares, and a
+    reference line at 0 (equal agreement). Accepts either the agreement table
+    (the ratio is computed) or the output of
+    :func:`compute_distance_tss_agreement_ratio`.
+    """
+    if "Log10Ratio" not in df_results.columns:
+        df_results = compute_distance_tss_agreement_ratio(df_results)
+    if "Group" in df_results.columns and df_results["Group"].nunique() > 1 \
+            and "All" in df_results["Group"].values:
+        df_results = df_results[df_results["Group"] == "All"]
+    labels = list(distance_labels)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    _draw_distance_tss_ratio(ax, df_results, labels)
+    ax.set_ylim(*(ylim or _distance_tss_log10_ylim(df_results["Log10Ratio"])))
+    ax.set_ylabel("log10(Between-sample /\nReplicate agreement)", fontsize=10)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0, fontsize=8, framealpha=0.9)
+    if title:
+        ax.set_title(title, fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    if out_path:
+        save_fig(fig, out_path)
+    return fig
+
+
+def plot_distance_tss_agreement_ratio_groups(df_results, groups,
+                                             title="log10 Between-sample / replicate agreement vs. Distance to TSS by state family",
+                                             out_path=None, distance_labels=DISTANCE_TSS_LABELS,
+                                             panel_size=(3.2, 4.2), ylim=None, models=None):
+    """1 x n panels of :func:`plot_distance_tss_agreement_ratio_grid`, one per
+    state family in ``groups``, sharing the y axis and a single method legend.
+    Groups with no rows are skipped.
+
+    ``models`` = "individual" or "joint" draws only those methods. The default
+    y range still spans all methods, so individual and joint figures share a
+    scale and can be compared directly.
+    """
+    methods = _distance_tss_ratio_methods(models)
+    if "Log10Ratio" not in df_results.columns:
+        df_results = compute_distance_tss_agreement_ratio(df_results)
+    labels = list(distance_labels)
+    groups = [g for g in groups if (df_results["Group"] == g).any()]
+    if not groups:
+        return None
+    df_sel = df_results[df_results["Group"].isin(groups)
+                        & df_results["Method"].isin(DISTANCE_TSS_RATIO_METHODS)]
+
+    n = len(groups)
+    fig, axes = plt.subplots(1, n, figsize=(panel_size[0] * n, panel_size[1]),
+                             sharex=True, sharey=True, squeeze=False)
+    for ax, g in zip(axes[0], groups):
+        _draw_distance_tss_ratio(ax, df_sel[df_sel["Group"] == g], labels, methods)
+        ax.set_title(g, fontsize=11, fontweight="bold")
+    axes[0, 0].set_ylim(*(ylim or _distance_tss_log10_ylim(df_sel["Log10Ratio"])))
+    axes[0, 0].set_ylabel("log10(Between-sample /\nReplicate agreement)", fontsize=10)
+    handles, leg_labels = axes[0, -1].get_legend_handles_labels()
+    if handles:
+        axes[0, -1].legend(handles, leg_labels, bbox_to_anchor=(1.02, 1), loc="upper left",
+                           borderaxespad=0, fontsize=8, framealpha=0.9)
+    if title:
+        fig.suptitle(title, fontsize=12, fontweight="bold", y=1.02)
     plt.tight_layout()
     if out_path:
         save_fig(fig, out_path)

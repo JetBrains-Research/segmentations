@@ -3,6 +3,7 @@ import gzip
 import os
 import tempfile
 import pytest
+import numpy as np
 import pandas as pd
 
 import sys
@@ -758,7 +759,7 @@ def test_plot_methods_consistency(tmp_path):
 
 
 def test_distance_tss_discordance(tmp_path):
-    """Test Distance-to-TSS tier computation, bed loading, discordance rate, and grid plotting."""
+    """Test Distance-to-TSS tier computation, bed loading, agreement & discordance rates, and grid plotting."""
     # 1. Create a dummy GTF file
     gtf_file = tmp_path / "test.gtf"
     gtf_lines = [
@@ -803,11 +804,31 @@ def test_distance_tss_discordance(tmp_path):
     assert "chr1" in codes_a
     assert codes_a["chr1"][0] == analyze.STATE_CANONICAL_IDX["TssA"]
 
+    agreement = analyze.compute_distance_tss_agreement(codes_a, codes_b, dist_tiers)
     discordance = analyze.compute_distance_tss_discordance(codes_a, codes_b, dist_tiers)
+    assert len(agreement) == len(analyze.DISTANCE_TSS_LABELS)
     assert len(discordance) == len(analyze.DISTANCE_TSS_LABELS)
+    assert 0.0 <= agreement[0] <= 1.0
     assert 0.0 <= discordance[0] <= 1.0
+    assert np.allclose(agreement[0] + discordance[0], 1.0)
 
-    # 3. Test grid plot with dummy data
+    # Test target_codes for specific state families
+    tss_code = analyze.STATE_CANONICAL_IDX["TssA"]
+    aggr_tss = analyze.compute_distance_tss_agreement(codes_a, codes_b, dist_tiers, target_codes=[tss_code])
+    disc_tss = analyze.compute_distance_tss_discordance(codes_a, codes_b, dist_tiers, target_codes=[tss_code])
+    assert len(aggr_tss) == len(analyze.DISTANCE_TSS_LABELS)
+    assert aggr_tss[0] == 1.0  # TssA matches between bed_a and bed_b at tier 0
+    assert disc_tss[0] == 0.0
+
+    enh_code = analyze.STATE_CANONICAL_IDX["Enh"]
+    aggr_enh = analyze.compute_distance_tss_agreement(codes_a, codes_b, dist_tiers, target_codes=[enh_code])
+    disc_enh = analyze.compute_distance_tss_discordance(codes_a, codes_b, dist_tiers, target_codes=[enh_code])
+    assert len(aggr_enh) == len(analyze.DISTANCE_TSS_LABELS)
+    # Enh in bed_a vs Tx in bed_b -> mismatch in bins covering Enh
+    assert np.any(disc_enh > 0.0)
+    assert np.any(aggr_enh < 1.0)
+
+    # 3. Test grid plot with dummy agreement & discordance data
     rows = []
     methods = [
         utils.CHROMHMM_DEFAULT, utils.KMEANS_HOMER, utils.KMEANS_MACS2, utils.KMEANS_OMNI,
@@ -816,17 +837,136 @@ def test_distance_tss_discordance(tmp_path):
     for m in methods:
         for t in ["Between", "Replicate"]:
             for lbl in analyze.DISTANCE_TSS_LABELS:
-                rows.append({"Method": m, "Type": t, "Distance": lbl, "Discordance": 0.25})
+                rows.append({"Method": m, "Type": t, "Distance": lbl, "Agreement": 0.75, "Discordance": 0.25, "Group": "All"})
+                rows.append({"Method": m, "Type": t, "Distance": lbl, "Agreement": 0.65, "Discordance": 0.35, "Group": "Promoter"})
 
     df_test = pd.DataFrame(rows)
     outpath_grid = str(tmp_path / "distance_tss_grid.pdf")
-    analyze.plot_distance_tss_discordance_grid(df_test, out_path=outpath_grid)
+    analyze.plot_distance_tss_agreement_grid(df_test, out_path=outpath_grid)
     assert os.path.exists(outpath_grid)
 
     outpath_grid_4x1 = str(tmp_path / "distance_tss_grid_4x1.pdf")
-    analyze.plot_distance_tss_discordance_grid(df_test, layout=(4, 1), figsize=(8, 10), out_path=outpath_grid_4x1)
+    analyze.plot_distance_tss_agreement_grid(df_test, layout=(4, 1), figsize=(8, 10), out_path=outpath_grid_4x1)
     assert os.path.exists(outpath_grid_4x1)
 
     outpath_grid_2x2 = str(tmp_path / "distance_tss_grid_2x2.pdf")
-    analyze.plot_distance_tss_discordance_grid(df_test, layout=(2, 2), figsize=(10, 7), out_path=outpath_grid_2x2)
+    analyze.plot_distance_tss_agreement_grid(df_test, layout=(2, 2), figsize=(10, 7), out_path=outpath_grid_2x2)
     assert os.path.exists(outpath_grid_2x2)
+
+    # Backward compatibility wrapper test
+    outpath_grid_disc = str(tmp_path / "distance_tss_disc_grid.pdf")
+    analyze.plot_distance_tss_discordance_grid(df_test, out_path=outpath_grid_disc)
+    assert os.path.exists(outpath_grid_disc)
+
+
+def test_distance_tss_family_agreement():
+    """Family-level agreement counts different states of one family as a match."""
+    idx = analyze.STATE_CANONICAL_IDX
+    # Six bins, all in tier 0: Tss/TssFlnk (same family, different state),
+    # TssA/TssA, TssA/Enh, Enh/Tx (no promoter call), unassigned bin.
+    codes_a = {"chr1": np.array([idx["Tss"], idx["TssA"], idx["TssA"], idx["Enh"], -1, idx["Tss"]], dtype=np.int16)}
+    codes_b = {"chr1": np.array([idx["TssFlnk"], idx["TssA"], idx["Enh"], idx["Tx"], idx["Tss"], idx["Tss"]], dtype=np.int16)}
+    tiers = {"chr1": np.zeros(6, dtype=np.int8)}
+    promoter = [idx[s] for s in ("Tss", "TssA", "TssFlnk")]
+
+    fam = analyze.compute_distance_tss_agreement(codes_a, codes_b, tiers, target_codes=promoter)
+    exact = analyze.compute_distance_tss_agreement(codes_a, codes_b, tiers, target_codes=promoter,
+                                                   family_match=False)
+    disc = analyze.compute_distance_tss_discordance(codes_a, codes_b, tiers, target_codes=promoter)
+    # Compared bins: 0, 1, 2, 5 (bin 3 has no promoter call, bin 4 is unassigned).
+    assert fam[0] == pytest.approx(3 / 4)
+    assert exact[0] == pytest.approx(2 / 4)
+    assert disc[0] == pytest.approx(1 / 4)
+    # Empty tiers stay 0 for both rates.
+    assert fam[1] == 0.0 and disc[1] == 0.0
+
+    # Without target codes, family_match has no effect: exact state equality.
+    all_states = analyze.compute_distance_tss_agreement(codes_a, codes_b, tiers)
+    assert all_states[0] == pytest.approx(2 / 5)
+
+
+def test_distance_tss_grid_aligns_by_label(tmp_path):
+    """Curves are aligned on the Distance label, not row order, and multiple
+    datasets are averaged per label."""
+    labels = list(analyze.DISTANCE_TSS_LABELS)
+    rows = []
+    for ds, offset in (("encode", 0.0), ("sagaconf", 0.2)):
+        for i, lbl in enumerate(labels):
+            rows.append({"Dataset": ds, "Method": utils.CHROMHMM_DEFAULT, "Type": "Between",
+                         "Distance": lbl, "Agreement": 0.1 * i / len(labels) + offset})
+    df = pd.DataFrame(rows).sample(frac=1.0, random_state=0)  # shuffle row order
+
+    fig = analyze.plot_distance_tss_agreement_grid(df, out_path=str(tmp_path / "grid.pdf"))
+    lines = fig.axes[0].get_lines()
+    assert len(lines) == 1
+    expected = [0.1 * i / len(labels) + 0.1 for i in range(len(labels))]
+    assert np.allclose(lines[0].get_ydata(), expected)
+
+
+def test_distance_tss_agreement_ratio(tmp_path):
+    """Between / replicate ratio per distance tier, NaN where replicate agreement is 0."""
+    labels = list(analyze.DISTANCE_TSS_LABELS)
+    rows = []
+    for m in (utils.CHROMHMM_DEFAULT, utils.JOINT_CHROMHMM):
+        for i, lbl in enumerate(labels):
+            rows.append({"Dataset": "encode", "Group": "All", "Method": m, "Type": "Replicate",
+                         "Distance": lbl, "Agreement": 0.0 if i == 0 else 0.8})
+            rows.append({"Dataset": "encode", "Group": "All", "Method": m, "Type": "Between",
+                         "Distance": lbl, "Agreement": 0.4})
+    df = pd.DataFrame(rows)
+    ratio = analyze.compute_distance_tss_agreement_ratio(df)
+    assert set(ratio.columns) >= {"Method", "Distance", "Between", "Replicate", "Ratio"}
+    assert len(ratio) == 2 * len(labels)
+    r = ratio[ratio["Method"] == utils.CHROMHMM_DEFAULT].set_index("Distance")["Ratio"]
+    assert np.isnan(r[labels[0]])
+    assert np.allclose(r[labels[1:]].values, 0.5)
+    lr = ratio[ratio["Method"] == utils.CHROMHMM_DEFAULT].set_index("Distance")["Log10Ratio"]
+    assert np.isnan(lr[labels[0]])
+    assert np.allclose(lr[labels[1:]].values, np.log10(0.5))
+
+    fig = analyze.plot_distance_tss_agreement_ratio_grid(df, out_path=str(tmp_path / "ratio.pdf"))
+    assert os.path.exists(tmp_path / "ratio.pdf")
+    ax0_lines = [l for l in fig.axes[0].get_lines() if len(l.get_xdata()) == len(labels)]
+    assert len(ax0_lines) == 2
+    assert np.allclose(np.asarray(ax0_lines[0].get_ydata())[1:], np.log10(0.5))
+
+
+def test_distance_tss_agreement_ratio_groups(tmp_path):
+    """1 x n family panels share the y axis; groups without rows are skipped."""
+    labels = list(analyze.DISTANCE_TSS_LABELS)
+    rows = []
+    for g, between in (("Promoter", 0.4), ("Enhancer", 0.08)):
+        for lbl in labels:
+            for t, v in (("Replicate", 0.8), ("Between", between)):
+                rows.append({"Dataset": "encode", "Group": g, "Method": utils.KMEANS_OMNI,
+                             "Type": t, "Distance": lbl, "Agreement": v})
+    df = pd.DataFrame(rows)
+    out = tmp_path / "groups.pdf"
+    fig = analyze.plot_distance_tss_agreement_ratio_groups(df, ["Promoter", "Missing", "Enhancer"], out_path=str(out))
+    assert out.exists()
+    axes = fig.axes
+    assert [ax.get_title() for ax in axes] == ["Promoter", "Enhancer"]
+    assert axes[0].get_ylim() == axes[1].get_ylim()
+    curve = [l for l in axes[1].get_lines() if len(l.get_xdata()) == len(labels)][0]
+    assert np.allclose(curve.get_ydata(), np.log10(0.1))
+    assert analyze.plot_distance_tss_agreement_ratio_groups(df, ["Missing"]) is None
+
+
+def test_distance_tss_agreement_ratio_groups_models(tmp_path):
+    """Individual / joint split draws only those methods on a shared y range."""
+    labels = list(analyze.DISTANCE_TSS_LABELS)
+    rows = []
+    for m, between in ((utils.KMEANS_OMNI, 0.4), (utils.JOINT_KMEANS_OMNI, 0.08)):
+        for lbl in labels:
+            for t, v in (("Replicate", 0.8), ("Between", between)):
+                rows.append({"Dataset": "encode", "Group": "Promoter", "Method": m,
+                             "Type": t, "Distance": lbl, "Agreement": v})
+    df = pd.DataFrame(rows)
+    figs = {k: analyze.plot_distance_tss_agreement_ratio_groups(df, ["Promoter"], models=k)
+            for k in ("individual", "joint")}
+    for k, m in (("individual", utils.KMEANS_OMNI), ("joint", utils.JOINT_KMEANS_OMNI)):
+        _, leg = figs[k].axes[0].get_legend_handles_labels()
+        assert leg == [utils.display_name(m)]
+    assert figs["individual"].axes[0].get_ylim() == figs["joint"].axes[0].get_ylim()
+    with pytest.raises(ValueError):
+        analyze.plot_distance_tss_agreement_ratio_groups(df, ["Promoter"], models="both")
